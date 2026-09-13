@@ -100,15 +100,25 @@ Expected: compila. Si falla por features de `librqbit`, inspeccionar con `cargo 
 
 ```rust
 //! Spike: confirma que la API de librqbit 9.x que asumimos existe y compila.
+//!
+//! HALLAZGO (librqbit 9.0.1): `FileStream` NO es nombrable desde fuera del crate:
+//! `librqbit::FileStream` no está re-exportado en la raíz (E0425) y
+//! `librqbit::torrent_state` es módulo privado (E0603). Por eso el chequeo de
+//! traits se hace por inferencia sobre el valor que devuelve `ManagedTorrent::stream`.
 use std::sync::Arc;
 
-#[tokio::test]
-async fn file_stream_is_reexported_and_seekable() {
-    // Si esto compila, `librqbit::FileStream` es público y cumple AsyncRead+AsyncSeek.
-    fn assert_read_seek<T: tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin>() {}
-    assert_read_seek::<librqbit::FileStream>();
+/// Compila => `ManagedTorrent::stream(Arc<Self>, usize)` existe y su salida
+/// implementa `AsyncRead + AsyncSeek + Send + Unpin`. Nunca se ejecuta (solo typecheck).
+#[allow(dead_code)]
+async fn _managed_torrent_stream_is_seekable(mt: Arc<librqbit::ManagedTorrent>) {
+    fn assert_read_seek<T: tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin>(_: T) {}
+    let stream = mt.stream(0).await.unwrap();
+    assert_read_seek(stream);
+}
 
-    // `Session` se crea con new_with_opts y devuelve Arc<Session>.
+#[tokio::test]
+async fn session_builds_and_returns_arc() {
+    // `Session::new_with_opts(PathBuf, SessionOptions) -> Arc<Session>`.
     let dir = tempfile::tempdir().unwrap();
     let session: Arc<librqbit::Session> =
         librqbit::Session::new_with_opts(dir.path().to_path_buf(), Default::default())
@@ -121,7 +131,7 @@ async fn file_stream_is_reexported_and_seekable() {
 - [ ] **Step 5: Correr el spike**
 
 Run: `cargo test -p pistreaming-torrent --test api_spike -- --nocapture`
-Expected: PASS. Si `librqbit::FileStream` no está re-exportado, usar `librqbit::torrent_state::FileStream` (ajustar el import) y anotarlo.
+Expected: PASS. Nota: `librqbit::FileStream` NO es nombrable en 9.0.1 (módulo `torrent_state` privado); el spike verifica los bounds por inferencia. La versión vigente es `crates/torrent/tests/api_spike.rs`.
 
 - [ ] **Step 6: Commit**
 
@@ -650,11 +660,21 @@ fn is_video_name(name: &str) -> bool {
         .any(|ext| n.ends_with(ext))
 }
 
-/// Abre el `FileStream` de un archivo del torrent.
+/// Abre el stream de bytes de un archivo del torrent.
+///
+/// Devuelve `impl AsyncRead + AsyncSeek + Send + Unpin + 'static` porque el tipo
+/// concreto (`librqbit::FileStream`) NO es nombrable fuera del crate
+/// (`librqbit::torrent_state` es módulo privado; lo confirmó el spike de la Task 1).
+/// Esos bounds SON el contrato: el consumidor (`api`, Tasks 6/9) los toma
+/// genéricamente. Si alguna vez hay que unificar ramas, boxear como
+/// `Box<dyn AsyncRead + AsyncSeek + Send + Unpin>` (no `Pin<Box<...>>`).
 pub async fn torrent_stream(
     handle: &ManagedTorrentHandle,
     file_id: usize,
-) -> Result<librqbit::FileStream, CoreError> {
+) -> Result<
+    impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static,
+    CoreError,
+> {
     handle
         .clone()
         .stream(file_id)
