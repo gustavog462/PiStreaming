@@ -6,7 +6,6 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time;
 
 const MIGRATIONS: &str = r#"
 CREATE TABLE IF NOT EXISTS addons (

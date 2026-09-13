@@ -2,8 +2,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-static QUALITY_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)(2160p|4k|1080p|720p|480p)").unwrap());
 static SEEDS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"👤\s*(\d+)").unwrap());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -25,8 +23,8 @@ pub struct Stream {
     pub url: Option<String>,
     #[serde(default, rename = "infoHash")]
     pub info_hash: Option<String>,
-    #[serde(default)]
-    pub fileIdx: Option<u32>,
+    #[serde(default, rename = "fileIdx")]
+    pub file_idx: Option<u32>,
     #[serde(default)]
     pub sources: Vec<String>,
     /// Addon que lo aportó. Se rellena al federar (no viene del addon).
@@ -91,7 +89,7 @@ mod tests {
             title: None,
             url: None,
             info_hash: Some("abc".into()),
-            fileIdx: None,
+            file_idx: None,
             sources: vec![],
             source_addon: None,
         }

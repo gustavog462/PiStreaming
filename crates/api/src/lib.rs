@@ -3,12 +3,12 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use pistreaming_addons::AddonManager;
-use pistreaming_core::error::{CoreError, CoreResult};
+use pistreaming_core::error::CoreResult;
 use pistreaming_store::Store;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 
 pub struct AppState {
