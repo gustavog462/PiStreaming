@@ -23,17 +23,19 @@
     const session = location.pathname.split('/').pop();
     const v = document.getElementById('player');
     const err = document.getElementById('err');
+    let progressUrl = null;
     fetch(`/api/play/${session}`).then(r => r.json()).then(plan => {
       v.src = plan.playback_url;
       document.getElementById('raw').href = plan.raw_url || plan.playback_url;
+      progressUrl = plan.progress_url || null;
     }).catch(() => { v.src = `/stream/${session}`; });
     v.addEventListener('error', () => {
       err.textContent = 'El navegador no puede reproducir este archivo. Usá la URL cruda.';
     });
-    // Guarda progreso cada 10s si hay un id de meta conocido.
+    // Guarda progreso cada 10s si el plan trae una URL de progreso (kind/id).
     setInterval(() => {
-      if (!v.duration) return;
-      fetch(`/api/progress/${session}`, { method: 'PUT',
+      if (!v.duration || !progressUrl) return;
+      fetch(progressUrl, { method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ position: v.currentTime, duration: v.duration }) });
     }, 10000);

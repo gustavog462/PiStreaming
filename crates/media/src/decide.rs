@@ -53,6 +53,7 @@ pub fn decide(
         needs_recode_audio: audio_needs,
         video_codec: video,
         audio_codec: audio,
+        progress_url: None,
     })
 }
 

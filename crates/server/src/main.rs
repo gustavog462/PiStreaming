@@ -324,6 +324,7 @@ mod tests {
             needs_recode_audio: false,
             video_codec: "h264".into(),
             audio_codec: Some("aac".into()),
+            progress_url: None,
         };
         state.sessions.insert(PlaySession {
             id: active_id,
@@ -333,6 +334,7 @@ mod tests {
             cache_dir: active_dir.clone(),
             created_at: Instant::now(),
             ffmpeg: None,
+            progress_key: None,
         });
 
         // cache_max_gb = 0 fuerza la evicción por tamaño; TTL alto evita cerrar la viva.

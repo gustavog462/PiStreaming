@@ -270,6 +270,12 @@ pub struct PlayBody {
     pub magnet: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// Tipo de meta (`movie`/`series`) para construir la URL de progreso.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Id de meta para construir la URL de progreso.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// POST /api/play { magnet } -> PlaybackPlan
@@ -342,6 +348,22 @@ pub async fn play(
         plan.playback_url = raw_url.clone();
     }
 
+    // Identidad de meta (si vino en el body) para que el player sepa dónde
+    // persistir el progreso. La URL se arma con `kind`/`id` por separado: la
+    // clave usa `:` como separador y los valores no deben participar de él.
+    let progress_key = match (body.kind.as_deref(), body.id.as_deref()) {
+        (Some(k), Some(i)) if !k.is_empty() && !i.is_empty() => Some(format!("{k}:{i}")),
+        _ => None,
+    };
+    plan.progress_url = progress_key.as_ref().map(|_| {
+        format!(
+            "{}/api/progress/{}/{}",
+            st.public_base,
+            body.kind.as_deref().unwrap(),
+            body.id.as_deref().unwrap()
+        )
+    });
+
     st.sessions.insert(PlaySession {
         id: session_id.clone(),
         info_hash: added.info_hash.clone(),
@@ -350,6 +372,7 @@ pub async fn play(
         cache_dir,
         created_at: std::time::Instant::now(),
         ffmpeg: None,
+        progress_key: progress_key.clone(),
     });
 
     (StatusCode::OK, Json(plan)).into_response()

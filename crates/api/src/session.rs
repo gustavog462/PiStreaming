@@ -17,6 +17,8 @@ pub struct PlaySession {
     pub created_at: Instant,
     /// Child de ffmpeg para remux/recode, si aplica.
     pub ffmpeg: Option<tokio::process::Child>,
+    /// Clave compuesta `kind:id` para el progreso, si `POST /api/play` la recibió.
+    pub progress_key: Option<String>,
 }
 
 #[derive(Default)]
@@ -94,6 +96,7 @@ mod tests {
             needs_recode_audio: false,
             video_codec: "h264".into(),
             audio_codec: Some("aac".into()),
+            progress_url: None,
         }
     }
 
@@ -106,6 +109,7 @@ mod tests {
             cache_dir: "/tmp".into(),
             created_at: Instant::now(),
             ffmpeg: None,
+            progress_key: None,
         }
     }
 
