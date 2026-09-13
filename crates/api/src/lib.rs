@@ -313,9 +313,20 @@ pub async fn play(
     let raw_url = format!("{}/raw/{}", st.public_base, session_id);
     let playback_url = format!("{}/stream/{}", st.public_base, session_id);
 
-    let probe_input = local_probe_path(&added.handle, file_id);
-    let probe_result = match probe_input {
-        Some(path) => probe(path.to_str().unwrap()).await,
+    // El handle se registra ANTES del probe: `/raw/:session` resuelve por
+    // `st.handles` (y deriva el file_id del propio handle), así que debe existir
+    // para el fallback HTTP. librqbit crea el archivo local sparse (tamaño lógico
+    // sin datos) al tener metadata, así que `ffprobe` sobre esa ruta falla y hay
+    // que caer al `/raw`, que sí lee del torrent.
+    st.handles
+        .write()
+        .insert(session_id.clone(), added.handle.clone());
+
+    let probe_result = match local_probe_path(&added.handle, file_id) {
+        Some(path) => match probe(path.to_str().unwrap()).await {
+            Ok(p) => Ok(p),
+            Err(_) => probe(&raw_url).await,
+        },
         None => probe(&raw_url).await,
     };
     let p = match probe_result {
@@ -340,7 +351,6 @@ pub async fn play(
         created_at: std::time::Instant::now(),
         ffmpeg: None,
     });
-    st.handles.write().insert(session_id.clone(), added.handle);
 
     (StatusCode::OK, Json(plan)).into_response()
 }
@@ -355,9 +365,12 @@ pub async fn raw_stream(
         Some(h) => h,
         None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
     };
-    let file_id = match st.sessions.get(&session) {
-        Some(s) => s.read().file_id,
-        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+    // El file_id se deriva del handle (mismo criterio que `play`: el video más
+    // grande), no de `st.sessions`: así `/raw` sirve durante el probe de `play`,
+    // antes de que la PlaySession quede registrada.
+    let file_id = match pick_largest_video(&handle) {
+        Ok((id, _, _)) => id,
+        Err(e) => return core_err(e),
     };
     let len = match file_len(&handle, file_id) {
         Ok(l) => l,

@@ -162,7 +162,7 @@ POST /api/play {stream}         → motor agrega magnet (con egress bind),
 GET  /stream/:session           → sirve bytes con Range (o HLS) desde el .part
                                   mientras baja (buffer en disco)
                                   al terminar: keep → biblioteca, si no se evapora del caché
-GET/PUT /api/progress/:id       → resume
+GET/PUT /api/progress/:type/:id → resume
 ```
 
 ---
@@ -195,9 +195,12 @@ El video **NUNCA se transcodifica** (Pi sin encoder). Solo se cambia de contened
 | POST | `/api/play` | arranca sesión → `PlaybackPlan` |
 | GET | `/stream/:session` | bytes/HLS desde el .part (Range) |
 | GET | `/api/library` | biblioteca (`keep`) |
-| GET/PUT | `/api/progress/:id` | resume |
+| GET/PUT | `/api/progress/:type/:id` | resume |
 | GET | `/api/settings` · PUT | settings (egress, límites de caché) |
 | GET | `/icon.svg` · `/` | icono + UI |
+
+> **Refinado en Fase 2:** la clave de progreso es `{type}:{id}` sobre la tabla
+> `progress` (PK `id`), no el `id` solo.
 
 ---
 

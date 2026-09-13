@@ -2092,3 +2092,36 @@ git commit -m "test(fase2): e2e local y docs de verificación"
 3. Presencia de `AddonManager::empty()` (Task 8); si no existe, crear el estado dentro del test con `.await`.
 4. `AddTorrentOptions` debe implementar `Default` con los campos usados (`output_folder`, `overwrite`, `initial_peers`). Confirmed en el anclaje; si `output_folder` no es `Option<PathBuf>`, ajustar el tipo.
 5. `AddTorrent::from_local_filename` (Task 5, seeder) — confirmar nombre exacto en el ancoring (existe como `from_local_filename`).
+6. Resolución de magnet offline (Task 14): librqbit resuelve metadatos **antes** de deduplicar, así que un magnet "pelado" sin DHT/trackers/peers no resuelve (`input address stream exhausted`) y `POST /api/play` da 500. El E2E usa un tracker HTTP mínimo servido por el test.
+
+---
+
+## Verificación manual en el Pi (Fase 2)
+
+No hay `README.md` en el repo, así que la verificación manual queda documentada acá.
+
+```bash
+# En el Pi (arm64):
+cargo build --release
+PISTREAMING_DATA_DIR=/data PISTREAMING_HTTP_PORT=8000 ./target/release/pistreaming
+
+# En otra terminal (o navegador) del Pi:
+# 1) arrancar una sesión con un magnet real (el Pi sí tiene DHT/egress):
+curl -s -X POST http://localhost:8000/api/play \
+  -H 'content-type: application/json' \
+  -d '{"magnet":"magnet:?xt=urn:btih:<INFO_HASH>"}'
+# -> 200 + PlaybackPlan { session, route, playback_url, ... }
+
+# 2) abrir el player y verificar comportamiento:
+#    http://localhost:8000/play/<session>
+#    - reproduce mientras baja (no espera el archivo completo),
+#    - seek/forward avanza (Range sobre el .part),
+#    - al terminar: keep -> biblioteca; si no -> se evapora del caché.
+```
+
+### Desviaciones registradas (Task 14)
+
+- **Probe blocker**: `play()` inserta el handle en `st.handles` **antes** del probe y, si `ffprobe` falla sobre la ruta local sparse, cae a `probe(&raw_url)`.
+- **`raw_stream`**: deriva el `file_id` del handle (`pick_largest_video`) en vez de `st.sessions`, para que `/raw/:session` sirva durante el probe en vuelo (la `PlaySession` todavía no está registrada).
+- **E2E (red aislada)**: el magnet declara `tr=` apuntando a un tracker HTTP mínimo levantado por el propio test, y la sesión cliente conserva DHT off pero con trackers habilitados (el magnet solo lista el tracker local). No se usó `initial_peers` porque el engine re-resuelve el magnet antes de deduplicar.
+- **`cargo fmt --check` fuera del gate**: el repo arrastra deuda de formato preexistente (63 diffs en 15 archivos). Solo se formatearon los archivos tocados; `e2e_local.rs` queda limpio. El gate efectivo es `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`.
