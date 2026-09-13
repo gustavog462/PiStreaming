@@ -5,6 +5,7 @@ use pistreaming_core::error::{CoreError, CoreResult};
 use pistreaming_core::manifest::Manifest;
 use pistreaming_core::meta::{MetaDetail, MetaItem};
 use pistreaming_core::stream::Stream;
+use pistreaming_store::Store;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -126,6 +127,15 @@ impl AddonManager {
         Self { client, addons: Vec::new() }
     }
 
+    /// Construye un manager cargando los addons ya persistidos en `store`.
+    pub async fn load(store: &Store) -> CoreResult<Self> {
+        let mut mgr = Self::new(AddonClient::new(reqwest::Client::new()));
+        for row in store.list_addons()? {
+            mgr.push(&row.url, row.manifest, row.enabled);
+        }
+        Ok(mgr)
+    }
+
     pub fn addons(&self) -> &[AddonRef] {
         &self.addons
     }
@@ -155,7 +165,7 @@ impl AddonManager {
     }
 
     /// Carga addons desde filas de store (manifest ya cacheado).
-    pub fn load(&mut self, url: &str, manifest: Manifest, enabled: bool) {
+    pub fn push(&mut self, url: &str, manifest: Manifest, enabled: bool) {
         self.addons.push(AddonRef {
             url: url.trim_end_matches('/').to_string(),
             manifest,

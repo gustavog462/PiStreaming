@@ -816,6 +816,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "pistreaming-core",
+ "pistreaming-store",
  "reqwest",
  "serde",
  "serde_json",

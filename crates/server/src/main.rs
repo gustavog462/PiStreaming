@@ -1,10 +1,11 @@
 use anyhow::Context;
-use pistreaming_addons::{AddonClient, AddonManager};
+use pistreaming_addons::AddonManager;
 use pistreaming_api::{router, AppState};
 use pistreaming_store::Store;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -81,13 +82,10 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir).ok();
     let store = Store::open(&cfg.data_dir.join("pistreaming.db"))?;
 
-    let mut mgr = AddonManager::new(AddonClient::new(reqwest::Client::new()));
-    for row in store.list_addons()? {
-        mgr.load(&row.url, row.manifest, row.enabled);
-    }
+    let mgr = AddonManager::load(&store).await?;
     tracing::info!(addons = mgr.addons().len(), "addons cargados");
 
-    let state = Arc::new(AppState { store, addons: mgr });
+    let state = Arc::new(AppState { store, addons: Arc::new(RwLock::new(mgr)) });
     let app = router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.http_port));

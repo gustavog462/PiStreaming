@@ -10,10 +10,11 @@ use pistreaming_core::error::CoreResult;
 use pistreaming_store::Store;
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct AppState {
     pub store: Store,
-    pub addons: AddonManager,
+    pub addons: Arc<RwLock<AddonManager>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -62,8 +63,13 @@ pub async fn add_addon(State(st): State<SharedState>, Json(body): Json<AddAddonB
 }
 
 async fn fetch_and_store(st: &SharedState, url: &str) -> CoreResult<String> {
-    let manifest = st.addons.client().fetch_manifest(url).await?;
+    let manifest = {
+        let mgr = st.addons.read().await;
+        mgr.client().fetch_manifest(url).await?
+    };
     st.store.add_addon(url, &manifest)?;
+    let fresh = AddonManager::load(&st.store).await?;
+    *st.addons.write().await = fresh;
     Ok(manifest.name)
 }
 
@@ -73,7 +79,13 @@ pub async fn remove_addon(
 ) -> Response {
     let url = decode_url(&url);
     match st.store.remove_addon(&url) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => match AddonManager::load(&st.store).await {
+            Ok(fresh) => {
+                *st.addons.write().await = fresh;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        },
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -93,7 +105,8 @@ pub async fn search(State(st): State<SharedState>, Query(q): Query<SearchQuery>)
     let Some(query) = q.query.filter(|s| !s.trim().is_empty()) else {
         return err(StatusCode::BAD_REQUEST, "falta el parámetro `query`");
     };
-    let metas = st.addons.search(&q.kind, &query).await;
+    let mgr = st.addons.read().await;
+    let metas = mgr.search(&q.kind, &query).await;
     Json(serde_json::json!({ "metas": metas })).into_response()
 }
 
@@ -101,7 +114,8 @@ pub async fn meta(
     State(st): State<SharedState>,
     axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    match st.addons.meta(&kind, &id).await {
+    let mgr = st.addons.read().await;
+    match mgr.meta(&kind, &id).await {
         Ok(m) => Json(m).into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, e.to_string()),
     }
@@ -111,7 +125,8 @@ pub async fn streams(
     State(st): State<SharedState>,
     axum::extract::Path((kind, id)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    let streams = st.addons.streams(&kind, &id).await;
+    let mgr = st.addons.read().await;
+    let streams = mgr.streams(&kind, &id).await;
     Json(serde_json::json!({ "streams": streams })).into_response()
 }
 
@@ -156,7 +171,7 @@ mod tests {
         let mut mgr = AddonManager::new(AddonClient::new(reqwest::Client::new()));
         mgr.add_from_url(&server.uri()).await.unwrap();
 
-        Arc::new(AppState { store, addons: mgr })
+        Arc::new(AppState { store, addons: Arc::new(RwLock::new(mgr)) })
     }
 
     #[tokio::test]
@@ -190,5 +205,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Regresión: un addon registrado por POST debe quedar visible al search
+    /// en la misma sesión (sin reiniciar el server).
+    #[tokio::test]
+    async fn add_addon_is_reflected_in_search_without_restart() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "org.mock", "version": "1.0.0", "name": "Mock",
+                "resources": ["catalog", "stream"], "types": ["movie"],
+                "catalogs": [{"type": "movie", "id": "top", "extra": [{"name": "search"}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top/search=dune.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metas": [{"id": "tt1", "type": "movie", "name": "Dune"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // store y manager arrancan vacíos: el alta debe poblar el manager en memoria.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let mgr = AddonManager::new(AddonClient::new(reqwest::Client::new()));
+        let app = router(Arc::new(AppState { store, addons: Arc::new(RwLock::new(mgr)) }));
+
+        let body = serde_json::json!({ "url": server.uri() }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/addons")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(Request::get("/api/search?query=dune").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["metas"][0]["id"], "tt1",
+            "el addon registrado debe reflejarse en el search sin reiniciar: {v}"
+        );
     }
 }
