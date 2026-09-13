@@ -130,6 +130,19 @@ impl AddonManager {
         &self.addons
     }
 
+    pub fn client(&self) -> &AddonClient {
+        &self.client
+    }
+
+    pub async fn meta(&self, kind: &str, id: &str) -> CoreResult<MetaDetail> {
+        for a in self.addons.iter().filter(|a| a.enabled && a.manifest.supports("meta")) {
+            if let Ok(m) = self.client.meta(&a.url, kind, id).await {
+                return Ok(m);
+            }
+        }
+        Err(CoreError::NotFound(format!("{kind}/{id}")))
+    }
+
     /// Registra un addon fetcheando su manifest. Falla si el manifest no carga.
     pub async fn add_from_url(&mut self, url: &str) -> CoreResult<()> {
         let manifest = self.client.fetch_manifest(url).await?;

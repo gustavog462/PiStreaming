@@ -834,6 +834,7 @@ dependencies = [
  "pistreaming-addons",
  "pistreaming-core",
  "pistreaming-store",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -841,6 +842,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

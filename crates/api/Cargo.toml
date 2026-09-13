@@ -19,3 +19,5 @@ tracing.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 tempfile.workspace = true
+wiremock.workspace = true
+reqwest.workspace = true
