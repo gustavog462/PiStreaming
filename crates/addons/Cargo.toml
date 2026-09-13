@@ -1,0 +1,17 @@
+[package]
+name = "pistreaming-addons"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pistreaming-core = { path = "../core" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

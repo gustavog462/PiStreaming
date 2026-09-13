@@ -1,0 +1,7 @@
+[package]
+name = "pistreaming-media"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pistreaming-core = { path = "../core" }

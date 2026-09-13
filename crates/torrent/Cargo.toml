@@ -1,0 +1,7 @@
+[package]
+name = "pistreaming-torrent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pistreaming-core = { path = "../core" }
