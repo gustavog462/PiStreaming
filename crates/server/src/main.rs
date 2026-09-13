@@ -159,7 +159,42 @@ async fn evict_cache(
 ) -> anyhow::Result<()> {
     use std::time::{Duration, SystemTime};
 
-    let active: std::collections::HashSet<String> = state.sessions.active_ids().into_iter().collect();
+    let ttl = Duration::from_secs(cache_ttl_hours * 3600);
+
+    // 1) Cerrar sesiones fuera de TTL: matar su ffmpeg, sacarlas del registry y
+    // borrar su caché. Así una sesión que expiró deja de estar activa y la
+    // carpeta puede ser evictada por tamaño/TTL en el paso siguiente.
+    for id in state.sessions.stale_ids(ttl) {
+        let Some(s) = state.sessions.remove(&id) else {
+            continue;
+        };
+        let (cache_dir, mut child) = {
+            let mut g = s.write();
+            (g.cache_dir.clone(), g.ffmpeg.take())
+        };
+        if let Some(child) = child.as_mut() {
+            if let Err(e) = child.kill().await {
+                tracing::warn!(error = %e, session = %id, "no se pudo matar ffmpeg");
+            }
+            if let Err(e) = child.wait().await {
+                tracing::warn!(error = %e, session = %id, "no se pudo esperar ffmpeg");
+            }
+        }
+        match tokio::fs::remove_dir_all(&cache_dir).await {
+            Ok(()) => tracing::info!(dir = %cache_dir.display(), "sesión stale cerrada"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %cache_dir.display(), "no se pudo borrar caché stale")
+            }
+        }
+    }
+
+    // 2) Eviction LRU por tamaño/TTL sobre las carpetas restantes. El nombre de
+    // carpeta es el `info_hash` completo; el guard debe comparar contra los
+    // `info_hash` vivos (no contra `active_ids`, que llevan el hash truncado a
+    // 12 chars y el file_id y por eso nunca matcheaban).
+    let active_hashes: std::collections::HashSet<String> =
+        state.sessions.active_info_hashes().into_iter().collect();
     let root = &state.cache_dir;
     let mut dirs: Vec<(std::path::PathBuf, u64, SystemTime)> = Vec::new();
     let mut total: u64 = 0;
@@ -171,7 +206,7 @@ async fn evict_cache(
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if active.iter().any(|a| a.starts_with(&name) || a.contains(&name)) {
+        if active_hashes.contains(&name) {
             continue; // sesión activa
         }
         let mut size = 0u64;
@@ -198,7 +233,6 @@ async fn evict_cache(
     // Orden LRU: los más viejos primero.
     dirs.sort_by_key(|(_, _, t)| *t);
 
-    let ttl = Duration::from_secs(cache_ttl_hours * 3600);
     let now = SystemTime::now();
     for (path, size, modified) in &dirs {
         let too_old = now.duration_since(*modified).map(|d| d > ttl).unwrap_or(false);
@@ -251,5 +285,66 @@ mod tests {
     fn default_ttl_matches_config_default() {
         let cfg = Config::from_sources(None, &BTreeMap::new()).unwrap();
         assert_eq!(cfg.cache_ttl_hours, 48);
+    }
+
+    /// Regresión: el guard de sesiones activas debe comparar el nombre de carpeta
+    /// (info_hash completo) contra los info_hash vivos, no contra los ids del
+    /// registry (hash truncado + file_id). Antes, la carpeta de una sesión en
+    /// reproducción se evictaba igual.
+    #[tokio::test]
+    async fn evict_cache_no_borra_sesion_activa() {
+        use super::evict_cache;
+        use pistreaming_api::session::PlaySession;
+        use pistreaming_core::playback::{PlaybackPlan, PlaybackRoute};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = pistreaming_api::test_state(dir.path().to_path_buf());
+
+        // info_hashes ficticios de 40 hex.
+        let active_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stale_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // Mismo formato que usa el registry: hash truncado a 12 + file_id.
+        let active_id = format!("{}-0", &active_hash[..12]);
+
+        // Carpetas de caché: el nombre es el info_hash completo.
+        let active_dir = dir.path().join(active_hash);
+        let stale_dir = dir.path().join(stale_hash);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(active_dir.join("playback.mp4"), vec![0u8; 128]).unwrap();
+        std::fs::write(stale_dir.join("playback.mp4"), vec![0u8; 128]).unwrap();
+
+        let plan = PlaybackPlan {
+            session: active_id.clone(),
+            route: PlaybackRoute::Direct,
+            playback_url: format!("/stream/{active_id}"),
+            raw_url: Some(format!("/raw/{active_id}")),
+            browser_may_fail: false,
+            needs_recode_audio: false,
+            video_codec: "h264".into(),
+            audio_codec: Some("aac".into()),
+        };
+        state.sessions.insert(PlaySession {
+            id: active_id,
+            info_hash: active_hash.into(),
+            file_id: 0,
+            plan,
+            cache_dir: active_dir.clone(),
+            created_at: Instant::now(),
+            ffmpeg: None,
+        });
+
+        // cache_max_gb = 0 fuerza la evicción por tamaño; TTL alto evita cerrar la viva.
+        evict_cache(&state, 0, 48).await.unwrap();
+
+        assert!(
+            active_dir.exists(),
+            "la carpeta de la sesión activa debe sobrevivir"
+        );
+        assert!(
+            !stale_dir.exists(),
+            "la carpeta sin sesión registrada debe borrarse"
+        );
     }
 }

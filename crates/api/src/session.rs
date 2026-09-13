@@ -48,6 +48,17 @@ impl PlaySessionRegistry {
         self.inner.read().keys().cloned().collect()
     }
 
+    /// `info_hash` de las sesiones vivas. A diferencia de `active_ids` (que usa
+    /// el id `hash[..12]-file_id`), este es el nombre real de la carpeta de
+    /// caché de la sesión, útil para eviction.
+    pub fn active_info_hashes(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .values()
+            .map(|s| s.read().info_hash.clone())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
