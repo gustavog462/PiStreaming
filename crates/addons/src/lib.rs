@@ -103,6 +103,115 @@ fn urlencoding(s: &str) -> String {
         .replace('?', "%3F")
 }
 
+use futures::future::join_all;
+use pistreaming_core::stream::rank_streams;
+use std::collections::HashSet;
+use tracing::warn;
+
+#[derive(Clone)]
+pub struct AddonRef {
+    pub url: String,
+    pub manifest: Manifest,
+    pub enabled: bool,
+}
+
+#[derive(Clone)]
+pub struct AddonManager {
+    client: AddonClient,
+    addons: Vec<AddonRef>,
+}
+
+impl AddonManager {
+    pub fn new(client: AddonClient) -> Self {
+        Self { client, addons: Vec::new() }
+    }
+
+    pub fn addons(&self) -> &[AddonRef] {
+        &self.addons
+    }
+
+    /// Registra un addon fetcheando su manifest. Falla si el manifest no carga.
+    pub async fn add_from_url(&mut self, url: &str) -> CoreResult<()> {
+        let manifest = self.client.fetch_manifest(url).await?;
+        self.addons.push(AddonRef {
+            url: url.trim_end_matches('/').to_string(),
+            manifest,
+            enabled: true,
+        });
+        Ok(())
+    }
+
+    /// Carga addons desde filas de store (manifest ya cacheado).
+    pub fn load(&mut self, url: &str, manifest: Manifest, enabled: bool) {
+        self.addons.push(AddonRef {
+            url: url.trim_end_matches('/').to_string(),
+            manifest,
+            enabled,
+        });
+    }
+
+    pub async fn search(&self, kind: &str, query: &str) -> Vec<MetaItem> {
+        let mut futs = Vec::new();
+        for a in self.addons.iter().filter(|a| a.enabled) {
+            for catalog in a.manifest.search_catalogs() {
+                if catalog.kind != kind {
+                    continue;
+                }
+                let req = CatalogRequest::search(&catalog.kind, &catalog.id, query);
+                let base = a.url.clone();
+                let client = self.client.clone();
+                futs.push(async move { (a.manifest.name.clone(), client.catalog(&base, &req).await) });
+            }
+        }
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (name, res) in join_all(futs).await {
+            match res {
+                Ok(metas) => {
+                    for m in metas {
+                        if seen.insert(m.id.clone()) {
+                            out.push(m);
+                        }
+                    }
+                }
+                Err(e) => warn!(addon = %name, error = %e, "catálogo falló"),
+            }
+        }
+        out
+    }
+
+    pub async fn streams(&self, kind: &str, id: &str) -> Vec<Stream> {
+        let mut futs = Vec::new();
+        for a in self.addons.iter().filter(|a| a.enabled && a.manifest.supports("stream")) {
+            let base = a.url.clone();
+            let client = self.client.clone();
+            let name = a.manifest.name.clone();
+            let kind = kind.to_string();
+            let id = id.to_string();
+            futs.push(async move {
+                let r = client.streams(&base, &kind, &id).await;
+                (name, r)
+            });
+        }
+
+        let mut out = Vec::new();
+        for (name, res) in join_all(futs).await {
+            match res {
+                Ok(mut streams) => {
+                    for s in streams.iter_mut() {
+                        s.source_addon = Some(name.clone());
+                    }
+                    out.extend(streams);
+                }
+                Err(e) => warn!(addon = %name, error = %e, "streams falló"),
+            }
+        }
+        rank_streams(&mut out);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +270,80 @@ mod tests {
         let streams = client.streams(&server.uri(), "movie", "tt1160419").await.unwrap();
         assert_eq!(streams.len(), 2);
         assert_eq!(streams[0].info_hash.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn manager_federates_and_dedupes() {
+        // dos addons mock que devuelven el mismo id + uno distinto
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        for server in [&a, &b] {
+            Mock::given(method("GET"))
+                .and(path("/manifest.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": format!("org.{}", server.uri().len()),
+                    "version": "1.0.0", "name": "Mock",
+                    "resources": ["catalog", "meta", "stream"], "types": ["movie"],
+                    "catalogs": [{"type": "movie", "id": "top", "extra": [{"name": "search"}]}]
+                })))
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top/search=dune.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metas": [{"id": "tt1", "type": "movie", "name": "Dune"}]
+            })))
+            .mount(&a)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/catalog/movie/top/search=dune.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metas": [
+                    {"id": "tt1", "type": "movie", "name": "Dune"},
+                    {"id": "tt2", "type": "movie", "name": "Dune Part Two"}
+                ]
+            })))
+            .mount(&b)
+            .await;
+
+        let client = AddonClient::new(reqwest::Client::new());
+        let mut mgr = AddonManager::new(client);
+        mgr.add_from_url(&a.uri()).await.unwrap();
+        mgr.add_from_url(&b.uri()).await.unwrap();
+
+        let metas = mgr.search("movie", "dune").await;
+        assert_eq!(metas.len(), 2, "dedupe por id");
+        assert!(metas.iter().any(|m| m.id == "tt2"));
+    }
+
+    #[tokio::test]
+    async fn manager_survives_a_dead_addon() {
+        let good = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "org.good", "version": "1.0.0", "name": "Good",
+                "resources": ["stream"], "types": ["movie"], "catalogs": []
+            })))
+            .mount(&good)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/stream/movie/tt1.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "streams": [{"name": "Good", "infoHash": "abc", "title": "1080p 👤 5"}]
+            })))
+            .mount(&good)
+            .await;
+
+        let client = AddonClient::new(reqwest::Client::new());
+        let mut mgr = AddonManager::new(client);
+        mgr.add_from_url(&good.uri()).await.unwrap();
+        // addon muerto: URL a un puerto cerrado
+        mgr.add_from_url("http://127.0.0.1:1").await.err();
+
+        let streams = mgr.streams("movie", "tt1").await;
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].source_addon.as_deref(), Some("Good"));
     }
 }
