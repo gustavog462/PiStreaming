@@ -2,8 +2,8 @@
 
 use crate::session::{PlaySession, PlaySessionRegistry};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -57,6 +57,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/meta/:kind/:id", get(meta))
         .route("/api/streams/:kind/:id", get(streams))
         .route("/api/play", axum::routing::post(play))
+        .route("/raw/:session", get(raw_stream))
+        .route("/stream/:session", get(stream))
         .with_state(state)
 }
 
@@ -273,6 +275,93 @@ pub async fn play(
     st.handles.write().insert(session_id.clone(), added.handle);
 
     (StatusCode::OK, Json(plan)).into_response()
+}
+
+/// GET /raw/:session — bytes crudos del FileStream con Range (fuente para ffmpeg).
+pub async fn raw_stream(
+    State(st): State<SharedState>,
+    Path(session): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let handle = match st.handles.read().get(&session).cloned() {
+        Some(h) => h,
+        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+    };
+    let file_id = match st.sessions.get(&session) {
+        Some(s) => s.read().file_id,
+        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+    };
+    let len = match file_len(&handle, file_id) {
+        Ok(l) => l,
+        Err(e) => return core_err(e),
+    };
+    let stream = match pistreaming_torrent::torrent_stream(&handle, file_id).await {
+        Ok(s) => s,
+        Err(e) => return core_err(e),
+    };
+    crate::range::ranged_response(stream, len, &headers, "application/octet-stream").await
+}
+
+/// GET /stream/:session — lo que consume el <video>. Directo: sirve el FileStream.
+/// (Remux/RecodeAudio se completan en la Task 10.)
+pub async fn stream(
+    State(st): State<SharedState>,
+    Path(session): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let handle = match st.handles.read().get(&session).cloned() {
+        Some(h) => h,
+        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+    };
+    let (file_id, route) = match st.sessions.get(&session) {
+        Some(s) => {
+            let g = s.read();
+            (g.file_id, g.plan.route)
+        }
+        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+    };
+
+    match route {
+        PlaybackRoute::Direct => {
+            let len = match file_len(&handle, file_id) {
+                Ok(l) => l,
+                Err(e) => return core_err(e),
+            };
+            let stream = match pistreaming_torrent::torrent_stream(&handle, file_id).await {
+                Ok(s) => s,
+                Err(e) => return core_err(e),
+            };
+            let mime = if session_mime(&st, &session).contains("webm") {
+                "video/webm"
+            } else {
+                "video/mp4"
+            };
+            crate::range::ranged_response(stream, len, &headers, mime).await
+        }
+        PlaybackRoute::Remux | PlaybackRoute::RecodeAudio => {
+            // Task 10.
+            err(StatusCode::NOT_IMPLEMENTED, "remux aún no implementado")
+        }
+    }
+}
+
+fn session_mime(_st: &SharedState, _session: &str) -> String {
+    "video/mp4".to_string()
+}
+
+/// Largo del archivo del torrent.
+///
+/// `torrent_stream` devuelve un RPIT opaco (`impl AsyncRead + AsyncSeek + ...`)
+/// que no expone `.len()`, y `librqbit::FileStream` no es nombrable (módulo
+/// privado), así que el largo se consulta a la metadata del handle.
+fn file_len(handle: &StdArc<librqbit::ManagedTorrent>, file_id: usize) -> Result<u64, CoreError> {
+    match handle.with_metadata(|m| m.file_infos.get(file_id).map(|f| f.len)) {
+        Ok(Some(l)) => Ok(l),
+        Ok(None) => Err(CoreError::NotFound(
+            "archivo no encontrado en el torrent".into(),
+        )),
+        Err(e) => Err(CoreError::Other(format!("metadata no disponible: {e}"))),
+    }
 }
 
 /// Ruta local del archivo dentro de la carpeta de salida de librqbit, si existe.
