@@ -2218,7 +2218,12 @@ dependencies = [
 name = "pistreaming-media"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "pistreaming-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
