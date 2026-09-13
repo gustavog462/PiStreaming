@@ -1,5 +1,6 @@
 //! API HTTP (axum) de PiStreaming — Fase 1.
 
+use crate::session::{PlaySession, PlaySessionRegistry};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -9,9 +10,13 @@ use axum::{Json, Router};
 use pistreaming_addons::{AddonClient, AddonManager};
 use pistreaming_core::error::{CoreError, CoreResult};
 use pistreaming_core::normalize_url;
+use pistreaming_core::playback::PlaybackRoute;
+use pistreaming_media::{decide, probe};
 use pistreaming_store::Store;
+use pistreaming_torrent::{add_magnet, pick_largest_video};
 use serde::Deserialize;
 use std::sync::Arc;
+use std::sync::Arc as StdArc;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod range;
@@ -24,6 +29,21 @@ pub struct AppState {
     pub addons: Arc<RwLock<AddonManager>>,
     /// Serializa las mutaciones (store write + reload + swap) de alta/baja.
     pub mutex: Mutex<()>,
+    /// Sesión de librqbit (None hasta que el server la crea tras el arranque).
+    pub torrents: tokio::sync::OnceCell<StdArc<librqbit::Session>>,
+    /// Raíz de caché de torrents; cada magnet escribe bajo `cache_dir/<info_hash>`.
+    pub cache_dir: std::path::PathBuf,
+    /// Base pública para construir las URLs `/raw` y `/stream`.
+    pub public_base: String,
+    /// Registro en memoria de sesiones de reproducción activas.
+    pub sessions: PlaySessionRegistry,
+    /// Handles de torrent vivos por session id, para que `/raw` y `/stream` los resuelvan.
+    ///
+    /// Se usa el tipo concreto `Arc<librqbit::ManagedTorrent>` (Opción A) porque
+    /// `librqbit::ManagedTorrentHandle` no está re-exportado en la raíz de 9.0.1
+    /// (vive en el módulo privado `torrent_state`). `ManagedTorrent` sí es público.
+    pub handles:
+        parking_lot::RwLock<std::collections::HashMap<String, StdArc<librqbit::ManagedTorrent>>>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -36,6 +56,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/search", get(search))
         .route("/api/meta/:kind/:id", get(meta))
         .route("/api/streams/:kind/:id", get(streams))
+        .route("/api/play", axum::routing::post(play))
         .with_state(state)
 }
 
@@ -174,6 +195,124 @@ fn decode_url(s: &str) -> String {
     s.replace("%2F", "/").replace("%3A", ":")
 }
 
+#[derive(Deserialize)]
+pub struct PlayBody {
+    pub magnet: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// POST /api/play { magnet } -> PlaybackPlan
+pub async fn play(
+    State(st): State<SharedState>,
+    body: Result<Json<PlayBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "body inválido");
+            return err(StatusCode::BAD_REQUEST, "body inválido");
+        }
+    };
+    let session = match st.torrents.get() {
+        Some(s) => s.clone(),
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine de torrents no inicializado",
+            )
+        }
+    };
+
+    // 1) agregar el magnet (crea la carpeta de caché por info_hash)
+    let added = match add_magnet(&session, &body.magnet, &st.cache_dir).await {
+        Ok(a) => a,
+        Err(e) => return core_err(e),
+    };
+    let cache_dir = st.cache_dir.join(&added.info_hash);
+    std::fs::create_dir_all(&cache_dir).ok();
+
+    // 2) elegir archivo de video
+    let (file_id, _name, _len) = match pick_largest_video(&added.handle) {
+        Ok(v) => v,
+        Err(e) => return core_err(e),
+    };
+
+    // 3) probe (la sesión se inserta al final)
+    let session_id = uuid_like(&added.info_hash, file_id);
+    let raw_url = format!("{}/raw/{}", st.public_base, session_id);
+    let playback_url = format!("{}/stream/{}", st.public_base, session_id);
+
+    let probe_input = local_probe_path(&added.handle, file_id);
+    let probe_result = match probe_input {
+        Some(path) => probe(path.to_str().unwrap()).await,
+        None => probe(&raw_url).await,
+    };
+    let p = match probe_result {
+        Ok(p) => p,
+        Err(e) => return core_err(e),
+    };
+
+    let mut plan = match decide(&session_id, &p, &playback_url, Some(&raw_url)) {
+        Ok(plan) => plan,
+        Err(e) => return core_err(e),
+    };
+    if plan.route == PlaybackRoute::Direct {
+        plan.playback_url = raw_url.clone();
+    }
+
+    st.sessions.insert(PlaySession {
+        id: session_id.clone(),
+        info_hash: added.info_hash.clone(),
+        file_id,
+        plan: plan.clone(),
+        cache_dir,
+        created_at: std::time::Instant::now(),
+        ffmpeg: None,
+    });
+    st.handles.write().insert(session_id.clone(), added.handle);
+
+    (StatusCode::OK, Json(plan)).into_response()
+}
+
+/// Ruta local del archivo dentro de la carpeta de salida de librqbit, si existe.
+fn local_probe_path(
+    handle: &StdArc<librqbit::ManagedTorrent>,
+    file_id: usize,
+) -> Option<std::path::PathBuf> {
+    handle
+        .with_metadata(|m| {
+            let f = m.file_infos.get(file_id)?;
+            Some(f.relative_filename.clone())
+        })
+        .ok()
+        .flatten()
+        .map(|rel| handle.output_folder().join(rel))
+}
+
+fn uuid_like(info_hash: &str, file_id: usize) -> String {
+    format!("{}-{}", &info_hash[..info_hash.len().min(12)], file_id)
+}
+
+/// Construye un AppState sin engine de torrents (test-only).
+#[doc(hidden)]
+pub fn test_state(dir: std::path::PathBuf) -> SharedState {
+    let store = Store::open(&dir.join("pistreaming.db")).expect("store");
+    let client = AddonClient::new(reqwest::Client::new());
+    let addons = AddonManager::new(client.clone());
+    StdArc::new(AppState {
+        store,
+        client,
+        addons: StdArc::new(RwLock::new(addons)),
+        mutex: Mutex::new(()),
+        torrents: tokio::sync::OnceCell::new(),
+        cache_dir: dir,
+        public_base: "http://127.0.0.1:8000".to_string(),
+        sessions: PlaySessionRegistry::new(),
+        handles: parking_lot::RwLock::new(std::collections::HashMap::new()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +363,11 @@ mod tests {
             client,
             addons: Arc::new(RwLock::new(mgr)),
             mutex: Mutex::new(()),
+            torrents: tokio::sync::OnceCell::new(),
+            cache_dir: dir.path().to_path_buf(),
+            public_base: "http://127.0.0.1:8000".to_string(),
+            sessions: PlaySessionRegistry::new(),
+            handles: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -241,7 +385,11 @@ mod tests {
     async fn search_returns_metas() {
         let app = router(test_state().await);
         let resp = app
-            .oneshot(Request::get("/api/search?query=dune").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/search?query=dune")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -292,6 +440,11 @@ mod tests {
             client,
             addons: Arc::new(RwLock::new(mgr)),
             mutex: Mutex::new(()),
+            torrents: tokio::sync::OnceCell::new(),
+            cache_dir: dir.path().to_path_buf(),
+            public_base: "http://127.0.0.1:8000".to_string(),
+            sessions: PlaySessionRegistry::new(),
+            handles: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }));
 
         let body = serde_json::json!({ "url": server.uri() }).to_string();
@@ -308,7 +461,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         let resp = app
-            .oneshot(Request::get("/api/search?query=dune").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/search?query=dune")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -329,14 +486,24 @@ mod tests {
     async fn streams_json_includes_source_addon() {
         let app = router(test_state().await);
         let resp = app
-            .oneshot(Request::get("/api/streams/movie/tt1").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/streams/movie/tt1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["streams"][0]["infoHash"], "abc123", "el stream debe aparecer: {v}");
-        assert_eq!(v["streams"][0]["source_addon"], "Mock", "source_addon debe serializarse: {v}");
+        assert_eq!(
+            v["streams"][0]["infoHash"], "abc123",
+            "el stream debe aparecer: {v}"
+        );
+        assert_eq!(
+            v["streams"][0]["source_addon"], "Mock",
+            "source_addon debe serializarse: {v}"
+        );
     }
 
     #[tokio::test]
@@ -377,7 +544,11 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(rows.len(), 1, "no debe duplicar por barra: {rows:?}");
-        assert_eq!(rows[0]["url"], m.uri(), "URL guardada normalizada: {rows:?}");
+        assert_eq!(
+            rows[0]["url"],
+            m.uri(),
+            "URL guardada normalizada: {rows:?}"
+        );
 
         // DELETE sin barra
         let resp = app
@@ -399,11 +570,18 @@ mod tests {
             .unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
-        assert!(rows.is_empty(), "el addon borrado no debe listarse: {rows:?}");
+        assert!(
+            rows.is_empty(),
+            "el addon borrado no debe listarse: {rows:?}"
+        );
 
         // y el search federado queda vacío
         let resp = app
-            .oneshot(Request::get("/api/search?query=dune").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/search?query=dune")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -470,8 +648,14 @@ mod tests {
             (CoreError::Http("x".into()), StatusCode::BAD_GATEWAY),
             (CoreError::Json("x".into()), StatusCode::BAD_GATEWAY),
             (CoreError::Db("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
-            (CoreError::Addon("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
-            (CoreError::Other("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                CoreError::Addon("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                CoreError::Other("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
         for (e, expected) in cases {
             assert_eq!(core_err(e).status(), expected);

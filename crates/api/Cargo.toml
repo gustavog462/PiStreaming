@@ -9,6 +9,8 @@ pistreaming-store = { path = "../store" }
 pistreaming-addons = { path = "../addons" }
 pistreaming-torrent = { path = "../torrent" }
 pistreaming-media = { path = "../media" }
+# Se necesita nombrar `librqbit::Session`/`ManagedTorrent` en `AppState` (ver lib.rs).
+librqbit.workspace = true
 bytes.workspace = true
 http.workspace = true
 tokio-util.workspace = true
@@ -21,10 +23,11 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+# `test_state` (helper `#[doc(hidden)]`) construye un `reqwest::Client`.
+reqwest.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 tempfile.workspace = true
 wiremock.workspace = true
-reqwest.workspace = true

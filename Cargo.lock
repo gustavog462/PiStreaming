@@ -2186,6 +2186,7 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
+ "librqbit",
  "parking_lot",
  "pistreaming-addons",
  "pistreaming-core",
