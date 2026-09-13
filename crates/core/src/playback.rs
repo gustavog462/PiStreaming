@@ -7,6 +7,8 @@ pub enum PlaybackRoute {
     Direct,
     /// Remux MKV→fMP4 (cambio de contenedor, sin recodificar video).
     Remux,
+    /// Remux + recodifica SOLO el audio a AAC (video `-c copy`).
+    RecodeAudio,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,5 +44,13 @@ mod tests {
         let j = serde_json::to_string(&p).unwrap();
         assert!(j.contains("\"route\":\"remux\""));
         assert!(j.contains("\"video_codec\":\"hevc\""));
+    }
+
+    #[test]
+    fn recode_audio_serializa_en_minusculas() {
+        let j = serde_json::to_string(&PlaybackRoute::RecodeAudio).unwrap();
+        assert_eq!(j, "\"recodeaudio\"");
+        let back: PlaybackRoute = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, PlaybackRoute::RecodeAudio);
     }
 }
