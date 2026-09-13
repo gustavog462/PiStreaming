@@ -56,6 +56,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/search", get(search))
         .route("/api/meta/:kind/:id", get(meta))
         .route("/api/streams/:kind/:id", get(streams))
+        .route(
+            "/api/progress/:kind/:id",
+            get(get_progress).put(put_progress),
+        )
         .route("/api/play", axum::routing::post(play))
         .route("/raw/:session", get(raw_stream))
         .route("/stream/:session", get(stream))
@@ -191,6 +195,46 @@ pub async fn streams(
     let mgr = st.addons.read().await.clone();
     let streams = mgr.streams(&kind, &id).await;
     Json(serde_json::json!({ "streams": streams })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ProgressBody {
+    pub position: f64,
+    #[serde(default)]
+    pub duration: Option<f64>,
+}
+
+/// GET /api/progress/:kind/:id
+pub async fn get_progress(
+    State(st): State<SharedState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> Response {
+    let key = format!("{kind}:{id}");
+    match st.store.get_progress(&key) {
+        Ok(Some((position, duration))) => Json(serde_json::json!({
+            "position": position, "duration": duration
+        }))
+        .into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "sin progreso"),
+        Err(e) => core_err(e),
+    }
+}
+
+/// PUT /api/progress/:kind/:id { position, duration? }
+pub async fn put_progress(
+    State(st): State<SharedState>,
+    Path((kind, id)): Path<(String, String)>,
+    body: Result<Json<ProgressBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body inválido"),
+    };
+    let key = format!("{kind}:{id}");
+    match st.store.save_progress(&key, body.position, body.duration) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => core_err(e),
+    }
 }
 
 fn decode_url(s: &str) -> String {
