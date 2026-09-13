@@ -6,6 +6,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time;
 
 const MIGRATIONS: &str = r#"
 CREATE TABLE IF NOT EXISTS addons (
@@ -111,6 +112,84 @@ impl Store {
             .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(())
     }
+
+    pub fn get_setting(&self, key: &str) -> CoreResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt.query(params![key]).map_err(|e| CoreError::Db(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
+            Ok(Some(row.get(0).map_err(|e| CoreError::Db(e.to_string()))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> CoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn save_progress(&self, id: &str, position: f64, duration: Option<f64>) -> CoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO progress (id, position, duration, updated_at) VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET position = excluded.position,
+                                           duration = excluded.duration,
+                                           updated_at = datetime('now')",
+            params![id, position, duration],
+        )
+        .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_progress(&self, id: &str) -> CoreResult<Option<(f64, Option<f64>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT position, duration FROM progress WHERE id = ?1")
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt.query(params![id]).map_err(|e| CoreError::Db(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
+            let pos: f64 = row.get(0).map_err(|e| CoreError::Db(e.to_string()))?;
+            let dur: Option<f64> = row.get(1).map_err(|e| CoreError::Db(e.to_string()))?;
+            Ok(Some((pos, dur)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn put_metadata_cache(&self, key: &str, json: &str, ttl_secs: i64) -> CoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO metadata_cache (key, json, expires_at)
+             VALUES (?1, ?2, datetime('now', ?3))
+             ON CONFLICT(key) DO UPDATE SET json = excluded.json,
+                                            expires_at = excluded.expires_at",
+            params![key, json, format!("{ttl_secs} seconds")],
+        )
+        .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_metadata_cache(&self, key: &str) -> CoreResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT json FROM metadata_cache WHERE key = ?1 AND expires_at > datetime('now')")
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt.query(params![key]).map_err(|e| CoreError::Db(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
+            Ok(Some(row.get(0).map_err(|e| CoreError::Db(e.to_string()))?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +244,36 @@ mod tests {
         let rows = store.list_addons().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "New");
+    }
+
+    #[test]
+    fn settings_roundtrip_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        assert_eq!(store.get_setting("egress_bind").unwrap(), None);
+        store.set_setting("egress_bind", "eth0").unwrap();
+        assert_eq!(store.get_setting("egress_bind").unwrap().as_deref(), Some("eth0"));
+        store.set_setting("egress_bind", "wg0").unwrap();
+        assert_eq!(store.get_setting("egress_bind").unwrap().as_deref(), Some("wg0"));
+    }
+
+    #[test]
+    fn progress_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        store.save_progress("tt1160419", 1234.5, Some(9300.0)).unwrap();
+        let p = store.get_progress("tt1160419").unwrap().unwrap();
+        assert_eq!(p.0, 1234.5);
+        assert_eq!(p.1, Some(9300.0));
+    }
+
+    #[test]
+    fn metadata_cache_hits_then_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        store.put_metadata_cache("meta:tt100", r#"{"a":1}"#, 3600).unwrap();
+        assert_eq!(store.get_metadata_cache("meta:tt100").unwrap().as_deref(), Some(r#"{"a":1}"#));
+        store.put_metadata_cache("meta:tt101", r#"{"b":2}"#, -1).unwrap();
+        assert_eq!(store.get_metadata_cache("meta:tt101").unwrap(), None);
     }
 }
