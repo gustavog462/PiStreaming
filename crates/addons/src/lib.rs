@@ -4,6 +4,7 @@ use pistreaming_core::catalog::CatalogRequest;
 use pistreaming_core::error::{CoreError, CoreResult};
 use pistreaming_core::manifest::Manifest;
 use pistreaming_core::meta::{MetaDetail, MetaItem};
+use pistreaming_core::normalize_url;
 use pistreaming_core::stream::Stream;
 use pistreaming_store::Store;
 use serde::Deserialize;
@@ -38,7 +39,7 @@ impl AddonClient {
     }
 
     fn base(url: &str) -> String {
-        url.trim_end_matches('/').to_string()
+        normalize_url(url)
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> CoreResult<T> {
@@ -127,9 +128,10 @@ impl AddonManager {
         Self { client, addons: Vec::new() }
     }
 
-    /// Construye un manager cargando los addons ya persistidos en `store`.
-    pub async fn load(store: &Store) -> CoreResult<Self> {
-        let mut mgr = Self::new(AddonClient::new(reqwest::Client::new()));
+    /// Construye un manager cargando los addons ya persistidos en `store`,
+    /// reusando el `AddonClient` configurado (no fabrica uno nuevo).
+    pub async fn load(client: AddonClient, store: &Store) -> CoreResult<Self> {
+        let mut mgr = Self::new(client);
         for row in store.list_addons()? {
             mgr.push(&row.url, row.manifest, row.enabled);
         }
@@ -157,7 +159,7 @@ impl AddonManager {
     pub async fn add_from_url(&mut self, url: &str) -> CoreResult<()> {
         let manifest = self.client.fetch_manifest(url).await?;
         self.addons.push(AddonRef {
-            url: url.trim_end_matches('/').to_string(),
+            url: normalize_url(url),
             manifest,
             enabled: true,
         });
@@ -167,7 +169,7 @@ impl AddonManager {
     /// Carga addons desde filas de store (manifest ya cacheado).
     pub fn push(&mut self, url: &str, manifest: Manifest, enabled: bool) {
         self.addons.push(AddonRef {
-            url: url.trim_end_matches('/').to_string(),
+            url: normalize_url(url),
             manifest,
             enabled,
         });

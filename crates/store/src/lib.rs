@@ -2,6 +2,7 @@
 
 use pistreaming_core::error::{CoreError, CoreResult};
 use pistreaming_core::manifest::Manifest;
+use pistreaming_core::normalize_url;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -57,6 +58,7 @@ impl Store {
     }
 
     pub fn add_addon(&self, url: &str, manifest: &Manifest) -> CoreResult<()> {
+        let url = normalize_url(url);
         let json = serde_json::to_string(manifest)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -105,11 +107,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn remove_addon(&self, url: &str) -> CoreResult<()> {
+    /// Borra el addon. Devuelve `true` si había una fila (y se borró).
+    pub fn remove_addon(&self, url: &str) -> CoreResult<bool> {
+        let url = normalize_url(url);
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM addons WHERE url = ?1", params![url])
+        let changes = conn
+            .execute("DELETE FROM addons WHERE url = ?1", params![url])
             .map_err(|e| CoreError::Db(e.to_string()))?;
-        Ok(())
+        Ok(changes > 0)
     }
 
     pub fn get_setting(&self, key: &str) -> CoreResult<Option<String>> {

@@ -1,11 +1,12 @@
 use anyhow::Context;
-use pistreaming_addons::AddonManager;
+use pistreaming_addons::{AddonClient, AddonManager};
 use pistreaming_api::{router, AppState};
 use pistreaming_store::Store;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -42,25 +43,41 @@ impl Default for Config {
 impl Config {
     /// Precedencia: defaults < archivo TOML < variables de entorno `PISTREAMING_*`.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
+        let toml_text = match path {
+            Some(p) if p.exists() => Some(
+                std::fs::read_to_string(p).with_context(|| format!("leyendo {}", p.display()))?,
+            ),
+            _ => None,
+        };
+        let env: BTreeMap<String, String> = std::env::vars().collect();
+        Self::from_sources(toml_text.as_deref(), &env)
+    }
+
+    /// Función pura (sin I/O ni env global): testeable y sin races.
+    // TODO(fase4): reconciliar nombres con spec §12 (hoy `PISTREAMING_*` en vez de
+    // `EGRESS_BIND` / `CACHE_TTL_HOURS` / `DATA_DIR`).
+    pub fn from_sources(
+        toml_text: Option<&str>,
+        env: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
         let mut cfg = Config::default();
-        if let Some(p) = path {
-            if p.exists() {
-                let text = std::fs::read_to_string(p)
-                    .with_context(|| format!("leyendo {}", p.display()))?;
-                cfg = toml::from_str(&text).context("parseando config.toml")?;
-            }
+        if let Some(text) = toml_text {
+            cfg = toml::from_str(text).context("parseando config.toml")?;
         }
-        if let Ok(v) = std::env::var("PISTREAMING_HTTP_PORT") {
+        if let Some(v) = env.get("PISTREAMING_HTTP_PORT") {
             cfg.http_port = v.parse().context("PISTREAMING_HTTP_PORT inválido")?;
         }
-        if let Ok(v) = std::env::var("PISTREAMING_EGRESS_BIND") {
-            cfg.egress_bind = v;
+        if let Some(v) = env.get("PISTREAMING_EGRESS_BIND") {
+            cfg.egress_bind = v.clone();
         }
-        if let Ok(v) = std::env::var("PISTREAMING_DATA_DIR") {
+        if let Some(v) = env.get("PISTREAMING_DATA_DIR") {
             cfg.data_dir = PathBuf::from(v);
         }
-        if let Ok(v) = std::env::var("PISTREAMING_CACHE_MAX_GB") {
+        if let Some(v) = env.get("PISTREAMING_CACHE_MAX_GB") {
             cfg.cache_max_gb = v.parse().context("PISTREAMING_CACHE_MAX_GB inválido")?;
+        }
+        if let Some(v) = env.get("PISTREAMING_CACHE_TTL_HOURS") {
+            cfg.cache_ttl_hours = v.parse().context("PISTREAMING_CACHE_TTL_HOURS inválido")?;
         }
         Ok(cfg)
     }
@@ -82,10 +99,16 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir).ok();
     let store = Store::open(&cfg.data_dir.join("pistreaming.db"))?;
 
-    let mgr = AddonManager::load(&store).await?;
+    let client = AddonClient::new(reqwest::Client::new());
+    let mgr = AddonManager::load(client.clone(), &store).await?;
     tracing::info!(addons = mgr.addons().len(), "addons cargados");
 
-    let state = Arc::new(AppState { store, addons: Arc::new(RwLock::new(mgr)) });
+    let state = Arc::new(AppState {
+        store,
+        client,
+        addons: Arc::new(RwLock::new(mgr)),
+        mutex: Mutex::new(()),
+    });
     let app = router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.http_port));
@@ -98,25 +121,41 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::collections::BTreeMap;
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
 
     #[test]
     fn env_overrides_defaults() {
-        std::env::set_var("PISTREAMING_HTTP_PORT", "9999");
-        std::env::set_var("PISTREAMING_EGRESS_BIND", "wg0");
-        let cfg = Config::load(None).unwrap();
+        let e = env(&[("PISTREAMING_HTTP_PORT", "9999"), ("PISTREAMING_EGRESS_BIND", "wg0")]);
+        let cfg = Config::from_sources(None, &e).unwrap();
         assert_eq!(cfg.http_port, 9999);
         assert_eq!(cfg.egress_bind, "wg0");
-        std::env::remove_var("PISTREAMING_HTTP_PORT");
-        std::env::remove_var("PISTREAMING_EGRESS_BIND");
     }
 
     #[test]
     fn toml_overrides_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "http_port = 7777\ncache_max_gb = 10\n").unwrap();
-        let cfg = Config::load(Some(&path)).unwrap();
+        let cfg = Config::from_sources(
+            Some("http_port = 7777\ncache_max_gb = 10\n"),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(cfg.http_port, 7777);
         assert_eq!(cfg.cache_max_gb, 10);
+    }
+
+    #[test]
+    fn env_overrides_toml_and_reads_ttl() {
+        let e = env(&[("PISTREAMING_CACHE_TTL_HOURS", "5")]);
+        let cfg = Config::from_sources(Some("cache_ttl_hours = 99\n"), &e).unwrap();
+        assert_eq!(cfg.cache_ttl_hours, 5);
+    }
+
+    #[test]
+    fn default_ttl_matches_config_default() {
+        let cfg = Config::from_sources(None, &BTreeMap::new()).unwrap();
+        assert_eq!(cfg.cache_ttl_hours, 48);
     }
 }

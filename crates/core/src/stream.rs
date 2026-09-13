@@ -28,7 +28,7 @@ pub struct Stream {
     #[serde(default)]
     pub sources: Vec<String>,
     /// Addon que lo aportó. Se rellena al federar (no viene del addon).
-    #[serde(skip)]
+    #[serde(default)]
     pub source_addon: Option<String>,
 }
 
