@@ -2234,10 +2234,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "parking_lot",
  "pistreaming-addons",
  "pistreaming-api",
  "pistreaming-core",
  "pistreaming-store",
+ "pistreaming-torrent",
  "reqwest 0.12.28",
  "serde",
  "tempfile",

@@ -103,18 +103,112 @@ async fn main() -> anyhow::Result<()> {
     let mgr = AddonManager::load(client.clone(), &store).await?;
     tracing::info!(addons = mgr.addons().len(), "addons cargados");
 
+    use pistreaming_torrent::open_session;
+
+    let cache_dir = cfg.data_dir.join("cache");
+    std::fs::create_dir_all(&cache_dir).ok();
+
+    let torrent_session = open_session(cache_dir.clone(), Some(cfg.egress_bind.clone())).await?;
+    tracing::info!(bind = %cfg.egress_bind, "sesión torrent abierta");
+
+    let registry = pistreaming_api::session::PlaySessionRegistry::new();
+    let torrents_cell = tokio::sync::OnceCell::new();
+    let _ = torrents_cell.set(torrent_session);
+
     let state = Arc::new(AppState {
         store,
         client,
         addons: Arc::new(RwLock::new(mgr)),
         mutex: Mutex::new(()),
+        torrents: torrents_cell,
+        cache_dir: cache_dir.clone(),
+        public_base: format!("http://127.0.0.1:{}", cfg.http_port),
+        sessions: registry,
+        handles: parking_lot::RwLock::new(Default::default()),
     });
+
+    // Job de eviction: cada 10 min, borra sesiones inactivas fuera de TTL o que
+    // excedan CACHE_MAX_GB. Nunca toca las sesiones activas del registro.
+    let evict_state = state.clone();
+    let cache_max_gb = cfg.cache_max_gb;
+    let cache_ttl_hours = cfg.cache_ttl_hours;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            tick.tick().await;
+            if let Err(e) = evict_cache(&evict_state, cache_max_gb, cache_ttl_hours).await {
+                tracing::warn!(error = %e, "eviction falló");
+            }
+        }
+    });
+
     let app = router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.http_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("escuchando en http://{addr}");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Eviction LRU por tamaño/TTL. No borra carpetas de sesiones activas.
+async fn evict_cache(
+    state: &pistreaming_api::SharedState,
+    cache_max_gb: u64,
+    cache_ttl_hours: u64,
+) -> anyhow::Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    let active: std::collections::HashSet<String> = state.sessions.active_ids().into_iter().collect();
+    let root = &state.cache_dir;
+    let mut dirs: Vec<(std::path::PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+
+    let mut entries = tokio::fs::read_dir(root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if active.iter().any(|a| a.starts_with(&name) || a.contains(&name)) {
+            continue; // sesión activa
+        }
+        let mut size = 0u64;
+        let mut newest = SystemTime::UNIX_EPOCH;
+        let mut stack = vec![path.clone()];
+        while let Some(p) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&p).await { Ok(r) => r, Err(_) => continue };
+            while let Some(f) = rd.next_entry().await.ok().flatten() {
+                let md = match f.metadata().await { Ok(m) => m, Err(_) => continue };
+                if md.is_dir() {
+                    stack.push(f.path());
+                } else {
+                    size += md.len();
+                    if let Ok(t) = md.modified() {
+                        if t > newest { newest = t; }
+                    }
+                }
+            }
+        }
+        total += size;
+        dirs.push((path, size, newest));
+    }
+
+    // Orden LRU: los más viejos primero.
+    dirs.sort_by_key(|(_, _, t)| *t);
+
+    let ttl = Duration::from_secs(cache_ttl_hours * 3600);
+    let now = SystemTime::now();
+    for (path, size, modified) in &dirs {
+        let too_old = now.duration_since(*modified).map(|d| d > ttl).unwrap_or(false);
+        let too_big = total > cache_max_gb * 1024 * 1024 * 1024;
+        if too_old || too_big {
+            tracing::info!(dir = %path.display(), "evictando caché");
+            tokio::fs::remove_dir_all(path).await.ok();
+            total = total.saturating_sub(*size);
+        }
+    }
     Ok(())
 }
 
