@@ -7,6 +7,12 @@ edition.workspace = true
 pistreaming-core = { path = "../core" }
 pistreaming-store = { path = "../store" }
 pistreaming-addons = { path = "../addons" }
+pistreaming-torrent = { path = "../torrent" }
+pistreaming-media = { path = "../media" }
+bytes.workspace = true
+http.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

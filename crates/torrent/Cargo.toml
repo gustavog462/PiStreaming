@@ -5,3 +5,12 @@ edition.workspace = true
 
 [dependencies]
 pistreaming-core = { path = "../core" }
+librqbit.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
