@@ -265,6 +265,35 @@ pub async fn play_plan(
     }
 }
 
+/// Base pública del plan derivada de los headers de la request.
+///
+/// Usa `Host` para el autoridad y `X-Forwarded-Proto` como esquema (si falta,
+/// `http`). Así el player abierto desde otra máquina (`http://192.168.x.x:port`)
+/// recibe URLs alcanzables en vez de `127.0.0.1`. Si `Host` falta o es inválido
+/// (vacío, con espacios o caracteres de control) cae a `fallback`.
+fn base_from_headers(headers: &HeaderMap, fallback: &str) -> String {
+    fn valid_token(s: &str) -> bool {
+        !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|h| valid_token(h));
+    match host {
+        Some(host) => {
+            let scheme = headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| valid_token(s))
+                .unwrap_or("http");
+            format!("{scheme}://{host}")
+        }
+        None => fallback.to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PlayBody {
     pub magnet: String,
@@ -281,6 +310,7 @@ pub struct PlayBody {
 /// POST /api/play { magnet } -> PlaybackPlan
 pub async fn play(
     State(st): State<SharedState>,
+    headers: HeaderMap,
     body: Result<Json<PlayBody>, JsonRejection>,
 ) -> Response {
     let Json(body) = match body {
@@ -316,8 +346,12 @@ pub async fn play(
 
     // 3) probe (la sesión se inserta al final)
     let session_id = uuid_like(&added.info_hash, file_id);
-    let raw_url = format!("{}/raw/{}", st.public_base, session_id);
-    let playback_url = format!("{}/stream/{}", st.public_base, session_id);
+    // El plan debe apuntar al host por el que entró el cliente (móvil/TV), no a
+    // `st.public_base` (que por defecto es 127.0.0.1). Si la request no trae un
+    // `Host` usable, se usa `st.public_base` como fallback.
+    let base = base_from_headers(&headers, &st.public_base);
+    let raw_url = format!("{}/raw/{}", base, session_id);
+    let playback_url = format!("{}/stream/{}", base, session_id);
 
     // El handle se registra ANTES del probe: `/raw/:session` resuelve por
     // `st.handles` (y deriva el file_id del propio handle), así que debe existir
@@ -358,7 +392,7 @@ pub async fn play(
     plan.progress_url = progress_key.as_ref().map(|_| {
         format!(
             "{}/api/progress/{}/{}",
-            st.public_base,
+            base,
             body.kind.as_deref().unwrap(),
             body.id.as_deref().unwrap()
         )
@@ -896,5 +930,55 @@ mod tests {
         for (e, expected) in cases {
             assert_eq!(core_err(e).status(), expected);
         }
+    }
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// El `Host` de la request define la base de las URLs del plan (`/raw`,
+    /// `/stream`, `/api/progress`), no el `public_base` fijo de `127.0.0.1`.
+    #[test]
+    fn host_de_la_request_define_la_base_de_las_urls() {
+        let h = headers_with(&[("host", "192.168.1.50:8000")]);
+        let base = base_from_headers(&h, "http://127.0.0.1:8000");
+        assert_eq!(base, "http://192.168.1.50:8000");
+        // Mismas plantillas que usa `play()` para el plan.
+        assert!(format!("{base}/raw/sess-0").starts_with("http://192.168.1.50:8000"));
+        assert!(format!("{base}/stream/sess-0").starts_with("http://192.168.1.50:8000"));
+        assert!(format!("{base}/api/progress/movie/tt1").starts_with("http://192.168.1.50:8000"));
+    }
+
+    #[test]
+    fn x_forwarded_proto_manda_el_esquema() {
+        let h = headers_with(&[("host", "stream.example:443"), ("x-forwarded-proto", "https")]);
+        assert_eq!(
+            base_from_headers(&h, "http://127.0.0.1:8000"),
+            "https://stream.example:443"
+        );
+    }
+
+    #[test]
+    fn host_ausente_o_invalido_cae_al_fallback() {
+        let fallback = "http://127.0.0.1:8000";
+        // Sin Host.
+        assert_eq!(base_from_headers(&HeaderMap::new(), fallback), fallback);
+        // Host vacío / solo espacios.
+        assert_eq!(
+            base_from_headers(&headers_with(&[("host", "   ")]), fallback),
+            fallback
+        );
+        // Host con espacio interno.
+        assert_eq!(
+            base_from_headers(&headers_with(&[("host", "bad host")]), fallback),
+            fallback
+        );
     }
 }
