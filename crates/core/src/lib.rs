@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod error;
 pub mod manifest;
 pub mod meta;
+pub mod playback;
 pub mod stream;
 
 pub use error::{CoreError, CoreResult};
