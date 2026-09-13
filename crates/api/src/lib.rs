@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod range;
+pub mod session;
 
 pub struct AppState {
     pub store: Store,
