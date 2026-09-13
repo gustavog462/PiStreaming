@@ -34,11 +34,13 @@ regex = "1"
 once_cell = "1"
 tempfile = "3"
 wiremock = "0.6"
-# librqbit 9 con features default (default-tls + http-api-client). No se necesita
-# `default-features = false` ni la feature interna `http-api` (axum 0.8). `FileStream`
-# y `ManagedTorrent::stream` se compilan siempre; OJO: `FileStream` no es nombrable
-# fuera del crate (ver crates/torrent/tests/api_spike.rs).
-librqbit = "9"
+# librqbit 9 SIN features default: `default-tls` arrastra `sha1-crypto-hash`
+# -> crypto-hash -> openssl-sys (OpenSSL nativo), que complica el cross-compile
+# a arm64/Pi. `rust-tls` usa `sha1-ring` + reqwest/rustls, sin OpenSSL nativo.
+# No se usa la feature interna `http-api` (axum 0.8). `ManagedTorrent::stream` y
+# `Session` se compilan siempre; OJO: `FileStream` no es nombrable fuera del crate
+# (ver crates/torrent/tests/api_spike.rs).
+librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 http = "1"
