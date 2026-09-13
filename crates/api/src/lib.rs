@@ -313,10 +313,14 @@ pub async fn stream(
         Some(h) => h,
         None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
     };
-    let (file_id, route) = match st.sessions.get(&session) {
+    let (file_id, route, is_webm) = match st.sessions.get(&session) {
         Some(s) => {
             let g = s.read();
-            (g.file_id, g.plan.route)
+            (
+                g.file_id,
+                g.plan.route,
+                matches!(g.plan.video_codec.as_str(), "vp8" | "vp9"),
+            )
         }
         None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
     };
@@ -331,11 +335,7 @@ pub async fn stream(
                 Ok(s) => s,
                 Err(e) => return core_err(e),
             };
-            let mime = if session_mime(&st, &session).contains("webm") {
-                "video/webm"
-            } else {
-                "video/mp4"
-            };
+            let mime = if is_webm { "video/webm" } else { "video/mp4" };
             crate::range::ranged_response(stream, len, &headers, mime).await
         }
         PlaybackRoute::Remux | PlaybackRoute::RecodeAudio => {
@@ -343,10 +343,6 @@ pub async fn stream(
             err(StatusCode::NOT_IMPLEMENTED, "remux aún no implementado")
         }
     }
-}
-
-fn session_mime(_st: &SharedState, _session: &str) -> String {
-    "video/mp4".to_string()
 }
 
 /// Largo del archivo del torrent.
