@@ -14,6 +14,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+pub mod range;
+
 pub struct AppState {
     pub store: Store,
     /// Cliente HTTP configurado, creado una sola vez y reusado al recargar el manager.
@@ -49,6 +51,7 @@ fn core_err(e: CoreError) -> Response {
         CoreError::Http(_) | CoreError::Json(_) => {
             (StatusCode::BAD_GATEWAY, "error del addon upstream")
         }
+        CoreError::Unsupported(_) => (StatusCode::UNPROCESSABLE_ENTITY, "no soportado"),
         CoreError::Db(_) | CoreError::Addon(_) | CoreError::Other(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "error interno")
         }
