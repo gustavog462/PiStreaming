@@ -339,8 +339,55 @@ pub async fn stream(
             crate::range::ranged_response(stream, len, &headers, mime).await
         }
         PlaybackRoute::Remux | PlaybackRoute::RecodeAudio => {
-            // Task 10.
-            err(StatusCode::NOT_IMPLEMENTED, "remux aún no implementado")
+            let (cache_dir, recode) = {
+                let s = match st.sessions.get(&session) {
+                    Some(s) => s,
+                    None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+                };
+                let g = s.read();
+                (g.cache_dir.clone(), g.plan.route == PlaybackRoute::RecodeAudio)
+            };
+            let out = cache_dir.join("playback.mp4");
+            let raw_url = format!("{}/raw/{}", st.public_base, session);
+
+            // Arranca ffmpeg una sola vez; sirve lo ya escrito.
+            let needs_spawn = !out.exists() || out.metadata().map(|m| m.len() == 0).unwrap_or(true);
+            if needs_spawn {
+                let child = if recode {
+                    pistreaming_media::ffmpeg::recode_audio(&raw_url, &out)
+                } else {
+                    pistreaming_media::ffmpeg::remux(&raw_url, &out)
+                };
+                match child {
+                    Ok(c) => {
+                        if let Some(s) = st.sessions.get(&session) {
+                            s.write().ffmpeg = Some(c);
+                        }
+                    }
+                    Err(e) => return core_err(e),
+                }
+            }
+
+            // Espera a que exista el archivo (o el cliente reconecta).
+            for _ in 0..40 {
+                if out.exists() && out.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if !out.exists() {
+                return err(StatusCode::GATEWAY_TIMEOUT, "ffmpeg no produjo salida");
+            }
+            use tokio::io::AsyncSeekExt;
+            let mut file = match tokio::fs::File::open(&out).await {
+                Ok(f) => f,
+                Err(_) => return err(StatusCode::GATEWAY_TIMEOUT, "salida no disponible"),
+            };
+            let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            let _ = file.seek(std::io::SeekFrom::Start(0)).await;
+            // fMP4 fragmentado: no se puede saber el largo final; se sirve lo disponible.
+            let headers2 = HeaderMap::new();
+            crate::range::ranged_response(file, len, &headers2, "video/mp4").await
         }
     }
 }
