@@ -5,7 +5,8 @@ edition.workspace = true
 
 [dependencies]
 pistreaming-core = { path = "../core" }
-tokio.workspace = true
+# `io-util` habilita `AsyncReadExt` (drenar stdout de ffmpeg en los tests).
+tokio = { workspace = true, features = ["io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

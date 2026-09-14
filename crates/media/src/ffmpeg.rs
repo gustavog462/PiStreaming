@@ -1,20 +1,21 @@
 //! Spawn de ffmpeg para remux (copia) o recode de audio.
 
-use std::path::Path;
 use std::process::Stdio;
 use pistreaming_core::error::CoreError;
 
-/// Remux MKV→fMP4 sin recodificar (`-c copy`). Escribe en `output` (se crea/crece).
-pub fn remux(input: &str, output: &Path) -> Result<tokio::process::Child, CoreError> {
-    ffmpeg(input, output, false)
+/// Remux MKV→fMP4 sin recodificar (`-c copy`). Escribe fMP4 fragmentado en
+/// stdout (`pipe:1`): el llamador debe tomar `child.stdout` y consumirlo.
+pub fn remux(input: &str) -> Result<tokio::process::Child, CoreError> {
+    ffmpeg(input, false)
 }
 
-/// Remux + recodifica solo el audio a AAC (video `-c copy`).
-pub fn recode_audio(input: &str, output: &Path) -> Result<tokio::process::Child, CoreError> {
-    ffmpeg(input, output, true)
+/// Remux + recodifica solo el audio a AAC (video `-c copy`). Igual que `remux`,
+/// la salida fMP4 va por stdout (`pipe:1`).
+pub fn recode_audio(input: &str) -> Result<tokio::process::Child, CoreError> {
+    ffmpeg(input, true)
 }
 
-fn ffmpeg(input: &str, output: &Path, recode: bool) -> Result<tokio::process::Child, CoreError> {
+fn ffmpeg(input: &str, recode: bool) -> Result<tokio::process::Child, CoreError> {
     let mut cmd = tokio::process::Command::new("ffmpeg");
     cmd.arg("-v").arg("error").arg("-y").arg("-i").arg(input);
     if recode {
@@ -23,11 +24,20 @@ fn ffmpeg(input: &str, output: &Path, recode: bool) -> Result<tokio::process::Ch
     } else {
         cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]);
     }
-    cmd.args(["-movflags", "frag_keyframe+empty_moov", "-f", "mp4"])
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    // fMP4 fragmentado por stdout. `default_base_moof` mejora la compatibilidad
+    // del init segment en streaming progresivo; el largo final es desconocido.
+    cmd.args([
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    // Si el consumidor (body HTTP) se suelta, el child muere.
+    .kill_on_drop(true);
     cmd.spawn()
         .map_err(|e| CoreError::Other(format!("no se pudo lanzar ffmpeg: {e}")))
 }
@@ -35,6 +45,8 @@ fn ffmpeg(input: &str, output: &Path, recode: bool) -> Result<tokio::process::Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use tokio::io::AsyncReadExt;
 
     fn ffmpeg_available() -> bool {
         std::process::Command::new("ffmpeg")
@@ -64,8 +76,16 @@ mod tests {
         input
     }
 
-    fn assert_fmp4(path: &Path) {
-        let bytes = std::fs::read(path).unwrap();
+    /// Drena stdout del child y espera a que termine. Devuelve `(bytes, éxito)`.
+    async fn drain(mut child: tokio::process::Child) -> (Vec<u8>, bool) {
+        let mut stdout = child.stdout.take().expect("stdout debe venir piped");
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.unwrap();
+        let ok = child.wait().await.unwrap().success();
+        (bytes, ok)
+    }
+
+    fn assert_fmp4(bytes: &[u8]) {
         assert!(bytes.len() >= 12, "salida demasiado chica: {} bytes", bytes.len());
         assert_eq!(&bytes[4..8], b"ftyp", "no es MP4 (falta ftyp)");
         assert!(
@@ -76,9 +96,8 @@ mod tests {
 
     #[tokio::test]
     async fn remux_sin_input_falla_rapido() {
-        let out = std::env::temp_dir().join("pistreaming_ffmpeg_test.mp4");
         // input inexistente: ffmpeg se lanza, sale con error; verificamos que spawn funciona.
-        let child = remux("/no/existe.mkv", &out);
+        let child = remux("/no/existe.mkv");
         assert!(child.is_ok(), "spawn debe funcionar si ffmpeg está instalado");
     }
 
@@ -90,10 +109,13 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let input = fixture(dir.path(), "aac");
+        let child = remux(input.to_str().unwrap()).unwrap();
+        let (bytes, ok) = drain(child).await;
+        assert!(ok, "ffmpeg remux falló");
+        assert_fmp4(&bytes);
+        // ffprobe necesita una ruta: persistimos los bytes drenados.
         let out = dir.path().join("playback.mp4");
-        let mut child = remux(input.to_str().unwrap(), &out).unwrap();
-        assert!(child.wait().await.unwrap().success(), "ffmpeg remux falló");
-        assert_fmp4(&out);
+        std::fs::write(&out, &bytes).unwrap();
         let p = crate::probe::probe(out.to_str().unwrap()).await.unwrap();
         assert_eq!(p.video_codec.as_deref(), Some("h264"));
         assert_eq!(p.audio_codec.as_deref(), Some("aac"));
@@ -107,10 +129,12 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let input = fixture(dir.path(), "ac3");
+        let child = recode_audio(input.to_str().unwrap()).unwrap();
+        let (bytes, ok) = drain(child).await;
+        assert!(ok, "ffmpeg recode falló");
+        assert_fmp4(&bytes);
         let out = dir.path().join("playback.mp4");
-        let mut child = recode_audio(input.to_str().unwrap(), &out).unwrap();
-        assert!(child.wait().await.unwrap().success(), "ffmpeg recode falló");
-        assert_fmp4(&out);
+        std::fs::write(&out, &bytes).unwrap();
         let p = crate::probe::probe(out.to_str().unwrap()).await.unwrap();
         assert_eq!(p.video_codec.as_deref(), Some("h264"));
         assert_eq!(p.audio_codec.as_deref(), Some("aac"), "el audio ac3 debe quedar aac");

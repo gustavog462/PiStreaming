@@ -422,7 +422,9 @@ pub async fn play(
     // `st.public_base` (que por defecto es 127.0.0.1). Si la request no trae un
     // `Host` usable, se usa `st.public_base` como fallback.
     let base = base_from_headers(&headers, &st.public_base);
-    let raw_url = format!("{}/raw/{}", base, session_id);
+    // `?file_id=` hace que `/raw` sirva el mismo archivo elegido (fileIdx) durante
+    // el probe, antes de que la PlaySession exista en el registry.
+    let raw_url = format!("{}/raw/{}?file_id={}", base, session_id, file_id);
     let playback_url = format!("{}/stream/{}", base, session_id);
 
     // El handle se registra ANTES del probe: `/raw/:session` resuelve por
@@ -489,22 +491,37 @@ pub async fn play(
     (StatusCode::OK, Json(plan)).into_response()
 }
 
+#[derive(Deserialize, Default)]
+pub struct RawQuery {
+    /// `file_id` explícito: solo se usa durante el probe de `play`, cuando la
+    /// PlaySession todavía no está registrada.
+    #[serde(default)]
+    pub file_id: Option<usize>,
+}
+
 /// GET /raw/:session — bytes crudos del FileStream con Range (fuente para ffmpeg).
 pub async fn raw_stream(
     State(st): State<SharedState>,
     Path(session): Path<String>,
+    Query(q): Query<RawQuery>,
     headers: HeaderMap,
 ) -> Response {
     let handle = match st.handles.read().get(&session).cloned() {
         Some(h) => h,
         None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
     };
-    // El file_id se deriva del handle (mismo criterio que `play`: el video más
-    // grande), no de `st.sessions`: así `/raw` sirve durante el probe de `play`,
-    // antes de que la PlaySession quede registrada.
-    let file_id = match pick_largest_video(&handle) {
-        Ok((id, _, _)) => id,
-        Err(e) => return core_err(e),
+    // Prioriza el `file_id` de la PlaySession para respetar el `fileIdx` del
+    // addon. Durante el probe de `play` la sesión no existe todavía: se acepta
+    // `?file_id=` explícito y, si no, se cae al video más grande (previo).
+    let file_id = if let Some(s) = st.sessions.get(&session) {
+        s.read().file_id
+    } else if let Some(id) = q.file_id {
+        id
+    } else {
+        match pick_largest_video(&handle) {
+            Ok((id, _, _)) => id,
+            Err(e) => return core_err(e),
+        }
     };
     let len = match file_len(&handle, file_id) {
         Ok(l) => l,
@@ -517,8 +534,11 @@ pub async fn raw_stream(
     crate::range::ranged_response(stream, len, &headers, "application/octet-stream").await
 }
 
-/// GET /stream/:session — lo que consume el <video>. Directo: sirve el FileStream.
-/// (Remux/RecodeAudio se completan en la Task 10.)
+/// GET /stream/:session — lo que consume el `<video>`.
+///
+/// `Direct` sirve el FileStream con `Range` (seekable). `Remux`/`RecodeAudio`
+/// transmiten un fMP4 fragmentado generado por ffmpeg *a stdout*: ruta de un solo
+/// consumidor, sin `Content-Length` ni `Accept-Ranges` (no hay seek ni largo total).
 pub async fn stream(
     State(st): State<SharedState>,
     Path(session): Path<String>,
@@ -554,55 +574,46 @@ pub async fn stream(
             crate::range::ranged_response(stream, len, &headers, mime).await
         }
         PlaybackRoute::Remux | PlaybackRoute::RecodeAudio => {
-            let (cache_dir, recode) = {
-                let s = match st.sessions.get(&session) {
-                    Some(s) => s,
-                    None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
-                };
-                let g = s.read();
-                (g.cache_dir.clone(), g.plan.route == PlaybackRoute::RecodeAudio)
+            let recode = match st.sessions.get(&session) {
+                Some(s) => s.read().plan.route == PlaybackRoute::RecodeAudio,
+                None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
             };
-            let out = cache_dir.join("playback.mp4");
-            let raw_url = format!("{}/raw/{}", st.public_base, session);
-
-            // Arranca ffmpeg una sola vez; sirve lo ya escrito.
-            let needs_spawn = !out.exists() || out.metadata().map(|m| m.len() == 0).unwrap_or(true);
-            if needs_spawn {
-                let child = if recode {
-                    pistreaming_media::ffmpeg::recode_audio(&raw_url, &out)
-                } else {
-                    pistreaming_media::ffmpeg::remux(&raw_url, &out)
-                };
-                match child {
-                    Ok(c) => {
-                        if let Some(s) = st.sessions.get(&session) {
-                            s.write().ffmpeg = Some(c);
-                        }
-                    }
-                    Err(e) => return core_err(e),
-                }
-            }
-
-            // Espera a que exista el archivo (o el cliente reconecta).
-            for _ in 0..40 {
-                if out.exists() && out.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            if !out.exists() {
-                return err(StatusCode::GATEWAY_TIMEOUT, "ffmpeg no produjo salida");
-            }
-            use tokio::io::AsyncSeekExt;
-            let mut file = match tokio::fs::File::open(&out).await {
-                Ok(f) => f,
-                Err(_) => return err(StatusCode::GATEWAY_TIMEOUT, "salida no disponible"),
+            // ffmpeg lee del propio `/raw` (con Range) y escribe fMP4 fragmentado
+            // a stdout. La respuesta transmite ese stdout en vivo: es de un solo
+            // consumidor y sin seek (no hay `Content-Length` final ni `Range`).
+            let raw_url = format!("{}/raw/{}?file_id={}", st.public_base, session, file_id);
+            let mut child = match if recode {
+                pistreaming_media::ffmpeg::recode_audio(&raw_url)
+            } else {
+                pistreaming_media::ffmpeg::remux(&raw_url)
+            } {
+                Ok(c) => c,
+                Err(e) => return core_err(e),
             };
-            let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-            let _ = file.seek(std::io::SeekFrom::Start(0)).await;
-            // fMP4 fragmentado: no se puede saber el largo final; se sirve lo disponible.
-            let headers2 = HeaderMap::new();
-            crate::range::ranged_response(file, len, &headers2, "video/mp4").await
+            let stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => return err(StatusCode::INTERNAL_SERVER_ERROR, "ffmpeg sin stdout"),
+            };
+            // El body es dueño de `child`: al dropearse (fin normal o corte del
+            // cliente), `kill_on_drop` mata el ffmpeg.
+            let stream = futures::stream::unfold(
+                (tokio_util::io::ReaderStream::new(stdout), child),
+                |(mut rs, child)| async move {
+                    use futures::StreamExt;
+                    rs.next().await.map(|item| (item, (rs, child)))
+                },
+            );
+            let mut resp = Response::new(axum::body::Body::from_stream(stream));
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("video/mp4"),
+            );
+            h.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            resp
         }
     }
 }
