@@ -201,7 +201,7 @@ async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()>
 
     let cache_max_gb = state.settings.cache_max_gb();
     let cache_ttl_hours = state.settings.cache_ttl_hours();
-    let ttl = Duration::from_secs(cache_ttl_hours * 3600);
+    let ttl = Duration::from_secs(cache_ttl_hours.saturating_mul(3600));
 
     // 1) Cerrar sesiones fuera de TTL: matar su ffmpeg, sacarlas del registry y
     // borrar su caché. Así una sesión que expiró deja de estar activa y la
@@ -282,7 +282,7 @@ async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()>
     let now = SystemTime::now();
     for (path, size, modified) in &dirs {
         let too_old = now.duration_since(*modified).map(|d| d > ttl).unwrap_or(false);
-        let too_big = total > cache_max_gb * 1024 * 1024 * 1024;
+        let too_big = total > cache_max_gb.saturating_mul(1024 * 1024 * 1024);
         if too_old || too_big {
             tracing::info!(dir = %path.display(), "evictando caché");
             tokio::fs::remove_dir_all(path).await.ok();

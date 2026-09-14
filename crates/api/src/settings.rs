@@ -103,7 +103,7 @@ pub async fn put_settings(
     let mut requires_restart: Vec<&str> = Vec::new();
 
     if let Some(val) = obj.get(KEY_CACHE_MAX_GB) {
-        let Some(n) = val.as_u64().filter(|n| *n > 0) else {
+        let Some(n) = val.as_u64().filter(|n| (1..=102_400).contains(n)) else {
             return field_err(KEY_CACHE_MAX_GB);
         };
         st.settings.set_cache_max_gb(n);
@@ -113,7 +113,7 @@ pub async fn put_settings(
         applied.push(KEY_CACHE_MAX_GB);
     }
     if let Some(val) = obj.get(KEY_CACHE_TTL_HOURS) {
-        let Some(n) = val.as_u64().filter(|n| *n > 0) else {
+        let Some(n) = val.as_u64().filter(|n| (1..=87_600).contains(n)) else {
             return field_err(KEY_CACHE_TTL_HOURS);
         };
         st.settings.set_cache_ttl_hours(n);
@@ -123,7 +123,11 @@ pub async fn put_settings(
         applied.push(KEY_CACHE_TTL_HOURS);
     }
     if let Some(val) = obj.get(KEY_EGRESS_BIND) {
-        let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(s) = val.as_str().map(str::trim).filter(|s| {
+            (1..=15).contains(&s.chars().count())
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        }) else {
             return field_err(KEY_EGRESS_BIND);
         };
         if let Err(e) = st.store.set_setting(KEY_EGRESS_BIND, s) {
@@ -132,7 +136,7 @@ pub async fn put_settings(
         requires_restart.push(KEY_EGRESS_BIND);
     }
     if let Some(val) = obj.get(KEY_HTTP_PORT) {
-        let Some(n) = val.as_u64().filter(|n| (1..=65535).contains(n)) else {
+        let Some(n) = val.as_u64().filter(|n| (1024..=65535).contains(n)) else {
             return field_err(KEY_HTTP_PORT);
         };
         if let Err(e) = st.store.set_setting(KEY_HTTP_PORT, &n.to_string()) {
@@ -210,6 +214,24 @@ mod tests {
         );
     }
 
+    async fn put_json(app: &axum::Router, body: &str) -> (StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
     #[tokio::test]
     async fn put_valor_invalido_es_400_con_el_campo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -231,6 +253,45 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(
             v["error"].as_str().unwrap().contains("cache_max_gb"),
+            "el 400 debe indicar el campo: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_cache_max_gb_fuera_de_rango_es_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, app) = app_con(&tmp);
+
+        let (status, v) = put_json(&app, r#"{"cache_max_gb":18446744073709551615}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"].as_str().unwrap().contains("cache_max_gb"),
+            "el 400 debe indicar el campo: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_egress_bind_invalido_es_400_con_el_campo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, app) = app_con(&tmp);
+
+        let (status, v) = put_json(&app, r#"{"egress_bind":"wg0; rm -rf /"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"].as_str().unwrap().contains("egress_bind"),
+            "el 400 debe indicar el campo: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_http_port_fuera_de_rango_es_400_con_el_campo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_st, app) = app_con(&tmp);
+
+        let (status, v) = put_json(&app, r#"{"http_port":80}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"].as_str().unwrap().contains("http_port"),
             "el 400 debe indicar el campo: {v}"
         );
     }

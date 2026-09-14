@@ -105,11 +105,24 @@ async function runSearch(q) {
   results.replaceChildren(...metas.map(metaCard));
 }
 
+// Devuelve una URL http/https normalizada, o null si el poster no es válido.
+// Evita inyectar declaraciones CSS por concatenación de strings.
+function safePosterUrl(poster) {
+  if (!poster) return null;
+  try {
+    const url = new URL(poster);
+    if (url.protocol === "http:" || url.protocol === "https:") return url.href;
+  } catch (_) {}
+  return null;
+}
+
 function metaCard(m) {
-  const poster = m.poster || m.background || "";
+  const poster = safePosterUrl(m.poster || m.background || "");
+  const cover = el("div", { class: "poster" },
+    poster ? null : el("span", { class: "poster-fallback" }, (m.name || "?").slice(0, 1)));
+  if (poster) cover.style.backgroundImage = `url("${poster}")`;
   return el("a", { class: "card", href: `#/detail/${m.type}/${encodeURIComponent(m.id)}` },
-    el("div", { class: "poster", style: poster ? `background-image:url('${poster}')` : "" },
-      poster ? null : el("span", { class: "poster-fallback" }, (m.name || "?").slice(0, 1))),
+    cover,
     el("div", { class: "card-title" }, m.name || m.id),
   );
 }
@@ -125,9 +138,12 @@ async function viewDetail(kind, id) {
   ]);
   const m = meta || { name: id };
   const streams = streamsData.streams || [];
+  const poster = safePosterUrl(m.poster || "");
+  const cover = el("div", { class: "poster large" },
+    poster ? null : el("span", { class: "poster-fallback" }, (m.name || "?").slice(0, 1)));
+  if (poster) cover.style.backgroundImage = `url("${poster}")`;
   const head = el("div", { class: "detail-head" },
-    el("div", { class: "poster large", style: m.poster ? `background-image:url('${m.poster}')` : "" },
-      m.poster ? null : el("span", { class: "poster-fallback" }, (m.name || "?").slice(0, 1))),
+    cover,
     el("div", { class: "detail-meta" },
       el("h1", {}, m.name || id),
       m.releaseInfo ? el("p", { class: "muted" }, m.releaseInfo) : null,
