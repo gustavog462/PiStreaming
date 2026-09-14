@@ -20,6 +20,8 @@ pub struct Config {
     pub cache_max_gb: u64,
     #[serde(default = "d_cache_ttl")]
     pub cache_ttl_hours: u64,
+    #[serde(default)]
+    pub library_dir: Option<PathBuf>,
 }
 
 fn d_data_dir() -> PathBuf { PathBuf::from("/data") }
@@ -36,12 +38,13 @@ impl Default for Config {
             egress_bind: d_egress(),
             cache_max_gb: d_cache_max(),
             cache_ttl_hours: d_cache_ttl(),
+            library_dir: None,
         }
     }
 }
 
 impl Config {
-    /// Precedencia: defaults < archivo TOML < variables de entorno `PISTREAMING_*`.
+    /// Precedencia: defaults < TOML < env (canónico spec §12, con fallback legacy `PISTREAMING_*`).
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let toml_text = match path {
             Some(p) if p.exists() => Some(
@@ -54,8 +57,6 @@ impl Config {
     }
 
     /// Función pura (sin I/O ni env global): testeable y sin races.
-    // TODO(fase4): reconciliar nombres con spec §12 (hoy `PISTREAMING_*` en vez de
-    // `EGRESS_BIND` / `CACHE_TTL_HOURS` / `DATA_DIR`).
     pub fn from_sources(
         toml_text: Option<&str>,
         env: &BTreeMap<String, String>,
@@ -67,20 +68,36 @@ impl Config {
         if let Some(v) = env.get("PISTREAMING_HTTP_PORT") {
             cfg.http_port = v.parse().context("PISTREAMING_HTTP_PORT inválido")?;
         }
-        if let Some(v) = env.get("PISTREAMING_EGRESS_BIND") {
-            cfg.egress_bind = v.clone();
+        if let Some(v) = pick(env, "EGRESS_BIND", "PISTREAMING_EGRESS_BIND") {
+            cfg.egress_bind = v.to_string();
         }
-        if let Some(v) = env.get("PISTREAMING_DATA_DIR") {
+        if let Some(v) = pick(env, "DATA_DIR", "PISTREAMING_DATA_DIR") {
             cfg.data_dir = PathBuf::from(v);
         }
-        if let Some(v) = env.get("PISTREAMING_CACHE_MAX_GB") {
-            cfg.cache_max_gb = v.parse().context("PISTREAMING_CACHE_MAX_GB inválido")?;
+        if let Some(v) = pick(env, "CACHE_MAX_GB", "PISTREAMING_CACHE_MAX_GB") {
+            cfg.cache_max_gb = v.parse().context("CACHE_MAX_GB inválido")?;
         }
-        if let Some(v) = env.get("PISTREAMING_CACHE_TTL_HOURS") {
-            cfg.cache_ttl_hours = v.parse().context("PISTREAMING_CACHE_TTL_HOURS inválido")?;
+        if let Some(v) = pick(env, "CACHE_TTL_HOURS", "PISTREAMING_CACHE_TTL_HOURS") {
+            cfg.cache_ttl_hours = v.parse().context("CACHE_TTL_HOURS inválido")?;
+        }
+        // `LIBRARY_DIR` no tiene nombre legacy; si no viene en env ni TOML, deriva
+        // `<data_dir>/library` del `data_dir` ya resuelto (env > TOML > default).
+        if let Some(v) = env.get("LIBRARY_DIR") {
+            cfg.library_dir = Some(PathBuf::from(v));
+        }
+        if cfg.library_dir.is_none() {
+            cfg.library_dir = Some(cfg.data_dir.join("library"));
         }
         Ok(cfg)
     }
+}
+
+/// Resuelve una variable de entorno con el nombre canónico del spec §12,
+/// cayendo al nombre legacy `PISTREAMING_*` si el canónico no está seteado.
+fn pick<'a>(env: &'a BTreeMap<String, String>, canonical: &str, legacy: &str) -> Option<&'a str> {
+    env.get(canonical)
+        .or_else(|| env.get(legacy))
+        .map(String::as_str)
 }
 
 #[tokio::main]
@@ -169,7 +186,10 @@ async fn main() -> anyhow::Result<()> {
             http_port,
             data_dir: cfg.data_dir.clone(),
         },
-        library_dir: cfg.data_dir.join("library"),
+        library_dir: cfg
+            .library_dir
+            .clone()
+            .unwrap_or_else(|| cfg.data_dir.join("library")),
     });
 
     // Job de eviction: cada 10 min, cierra sesiones inactivas fuera de TTL y
@@ -331,6 +351,53 @@ mod tests {
     fn default_ttl_matches_config_default() {
         let cfg = Config::from_sources(None, &BTreeMap::new()).unwrap();
         assert_eq!(cfg.cache_ttl_hours, 48);
+    }
+
+    #[test]
+    fn env_canonicas_del_spec_se_leen() {
+        let e = env(&[
+            ("EGRESS_BIND", "wg0"),
+            ("CACHE_TTL_HOURS", "7"),
+            ("DATA_DIR", "/mnt/datos"),
+        ]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(cfg.egress_bind, "wg0");
+        assert_eq!(cfg.cache_ttl_hours, 7);
+        assert_eq!(cfg.data_dir, std::path::PathBuf::from("/mnt/datos"));
+    }
+
+    #[test]
+    fn env_canonica_gana_sobre_legacy() {
+        let e = env(&[
+            ("CACHE_MAX_GB", "7"),
+            ("PISTREAMING_CACHE_MAX_GB", "99"),
+            ("DATA_DIR", "/canonico"),
+            ("PISTREAMING_DATA_DIR", "/legacy"),
+        ]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(cfg.cache_max_gb, 7);
+        assert_eq!(cfg.data_dir, std::path::PathBuf::from("/canonico"));
+    }
+
+    #[test]
+    fn library_dir_default_deriva_de_data_dir() {
+        // El default usa el data_dir YA resuelto (env), no el default crudo.
+        let e = env(&[("DATA_DIR", "/mnt/datos")]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(
+            cfg.library_dir.as_deref(),
+            Some(std::path::Path::new("/mnt/datos/library"))
+        );
+    }
+
+    #[test]
+    fn library_dir_explicito_gana_sobre_default() {
+        let e = env(&[("DATA_DIR", "/mnt/datos"), ("LIBRARY_DIR", "/mnt/library")]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(
+            cfg.library_dir.as_deref(),
+            Some(std::path::Path::new("/mnt/library"))
+        );
     }
 
     /// Regresión: el guard de sesiones activas debe comparar el nombre de carpeta
