@@ -63,3 +63,21 @@ async fn asset_inexistente_es_404() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn assets_sirven_js_con_su_content_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let app = pistreaming_api::router(pistreaming_api::test_state(tmp.path().to_path_buf()));
+    let res = app
+        .oneshot(Request::get("/assets/app.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+}
