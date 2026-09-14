@@ -409,6 +409,7 @@ pub async fn play(
         )
     });
 
+    let media_path = local_probe_path(&added.handle, file_id);
     st.sessions.insert(PlaySession {
         id: session_id.clone(),
         info_hash: added.info_hash.clone(),
@@ -418,6 +419,10 @@ pub async fn play(
         created_at: std::time::Instant::now(),
         ffmpeg: None,
         progress_key: progress_key.clone(),
+        kind: body.kind.clone(),
+        meta_id: body.id.clone(),
+        title: body.title.clone(),
+        media_path,
     });
 
     (StatusCode::OK, Json(plan)).into_response()

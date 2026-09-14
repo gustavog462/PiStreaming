@@ -45,6 +45,10 @@ async fn plan_expone_progress_url_de_dos_segmentos() {
         created_at: Instant::now(),
         ffmpeg: None,
         progress_key: Some("movie:tt123".into()),
+        kind: Some("movie".into()),
+        meta_id: Some("tt123".into()),
+        title: Some("Dune".into()),
+        media_path: None,
     });
 
     let app = pistreaming_api::router(st);

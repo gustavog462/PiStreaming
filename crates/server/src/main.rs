@@ -381,6 +381,10 @@ mod tests {
             created_at: Instant::now(),
             ffmpeg: None,
             progress_key: None,
+            kind: None,
+            meta_id: None,
+            title: None,
+            media_path: None,
         });
 
         // cache_max_gb = 0 fuerza la evicción por tamaño; TTL alto evita cerrar la viva.

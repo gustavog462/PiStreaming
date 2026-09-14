@@ -19,6 +19,14 @@ pub struct PlaySession {
     pub ffmpeg: Option<tokio::process::Child>,
     /// Clave compuesta `kind:id` para el progreso, si `POST /api/play` la recibió.
     pub progress_key: Option<String>,
+    /// Tipo de meta (`movie`/`series`) para la ficha de biblioteca.
+    pub kind: Option<String>,
+    /// Id de meta para la ficha de biblioteca (el `id` del `AppState` es de sesión).
+    pub meta_id: Option<String>,
+    /// Título de la ficha (cae a `meta_id` si falta).
+    pub title: Option<String>,
+    /// Ruta local del `.mkv`/`.mp4` final dentro de la caché de librqbit.
+    pub media_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -100,9 +108,9 @@ mod tests {
         }
     }
 
-    fn sess(id: &str) -> PlaySession {
+    fn sess(sid: &str) -> PlaySession {
         PlaySession {
-            id: id.into(),
+            id: sid.into(),
             info_hash: "abc".into(),
             file_id: 0,
             plan: plan(),
@@ -110,6 +118,10 @@ mod tests {
             created_at: Instant::now(),
             ffmpeg: None,
             progress_key: None,
+            kind: None,
+            meta_id: None,
+            title: None,
+            media_path: None,
         }
     }
 
@@ -133,5 +145,21 @@ mod tests {
         let stale = r.stale_ids(Duration::from_secs(60));
         assert_eq!(stale, vec!["old".to_string()]);
         assert_eq!(r.active_ids().len(), 2);
+    }
+
+    #[test]
+    fn sess_conserva_la_identidad_para_keep() {
+        let mut s = sess("k");
+        s.kind = Some("movie".into());
+        s.meta_id = Some("tt1".into());
+        s.title = Some("Dune".into());
+        s.media_path = Some("/data/cache/mm.mkv".into());
+        assert_eq!(s.kind.as_deref(), Some("movie"));
+        assert_eq!(s.meta_id.as_deref(), Some("tt1"));
+        assert_eq!(s.title.as_deref(), Some("Dune"));
+        assert_eq!(
+            s.media_path.as_deref(),
+            Some(std::path::Path::new("/data/cache/mm.mkv"))
+        );
     }
 }
