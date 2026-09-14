@@ -13,7 +13,7 @@ use pistreaming_core::normalize_url;
 use pistreaming_core::playback::PlaybackRoute;
 use pistreaming_media::{decide, probe};
 use pistreaming_store::Store;
-use pistreaming_torrent::{add_magnet, pick_largest_video};
+use pistreaming_torrent::{add_magnet, engine::pick_video_by_index, pick_largest_video};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
@@ -363,6 +363,9 @@ pub struct PlayBody {
     /// Id de meta para construir la URL de progreso.
     #[serde(default)]
     pub id: Option<String>,
+    /// Índice del archivo de video sugerido por el addon (Torrentio `fileIdx`).
+    #[serde(default, rename = "fileIdx")]
+    pub file_idx: Option<u32>,
 }
 
 /// POST /api/play { magnet } -> PlaybackPlan
@@ -396,10 +399,21 @@ pub async fn play(
     let cache_dir = st.cache_dir.join(&added.info_hash);
     std::fs::create_dir_all(&cache_dir).ok();
 
-    // 2) elegir archivo de video
-    let (file_id, _name, _len) = match pick_largest_video(&added.handle) {
-        Ok(v) => v,
-        Err(e) => return core_err(e),
+    // 2) elegir archivo de video. Si el addon manda `fileIdx` y apunta a un video
+    // válido, se respeta; si no (ausente o inválido), cae al video más grande.
+    let file_id: usize = match body.file_idx {
+        Some(idx) => match pick_video_by_index(&added.handle, idx as usize) {
+            Ok(Some(_)) => idx as usize,
+            Ok(None) => match pick_largest_video(&added.handle) {
+                Ok((id, _, _)) => id,
+                Err(e) => return core_err(e),
+            },
+            Err(e) => return core_err(e),
+        },
+        None => match pick_largest_video(&added.handle) {
+            Ok((id, _, _)) => id,
+            Err(e) => return core_err(e),
+        },
     };
 
     // 3) probe (la sesión se inserta al final)
@@ -1167,5 +1181,22 @@ mod tests {
             base_from_headers(&headers_with(&[("host", "bad host")]), fallback),
             fallback
         );
+    }
+
+    #[test]
+    fn play_body_deserializa_file_idx_camel_case() {
+        let body: PlayBody = serde_json::from_value(serde_json::json!({
+            "magnet": "magnet:?xt=urn:btih:abc",
+            "fileIdx": 3
+        }))
+        .unwrap();
+        assert_eq!(body.file_idx, Some(3));
+
+        // Sin el campo -> None (y el resto del body sigue funcionando).
+        let body: PlayBody = serde_json::from_value(serde_json::json!({
+            "magnet": "magnet:?xt=urn:btih:abc"
+        }))
+        .unwrap();
+        assert_eq!(body.file_idx, None);
     }
 }

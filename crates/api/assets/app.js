@@ -216,13 +216,24 @@ async function viewDetail(kind, id) {
 }
 
 async function startPlay(stream, kind, id, title) {
-  const magnet = stream.infoHash ? `magnet:?xt=urn:btih:${stream.infoHash}` : stream.url;
+  let magnet = stream.url;
+  if (stream.infoHash) {
+    // Fusiona los `sources` del addon: solo `tracker:<url>` van como `tr=`.
+    const params = new URLSearchParams();
+    params.append("xt", `urn:btih:${stream.infoHash}`);
+    for (const src of stream.sources || []) {
+      if (typeof src === "string" && src.startsWith("tracker:")) {
+        params.append("tr", src.slice("tracker:".length));
+      }
+    }
+    magnet = `magnet:?${params.toString()}`;
+  }
   if (!magnet) { showBanner("La fuente no trae magnet ni url"); return; }
   try {
     const plan = await api("/api/play", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ magnet, title, kind, id }),
+      body: JSON.stringify({ magnet, title, kind, id, fileIdx: stream.fileIdx ?? null }),
     });
     location.hash = `#/player/${encodeURIComponent(plan.session)}`;
   } catch (e) { showBanner(e.message); }

@@ -62,17 +62,60 @@ pub async fn add_magnet(
 
 /// Devuelve `(file_id, nombre relativo, len)` del video más grande del torrent.
 pub fn pick_largest_video(handle: &ManagedTorrentHandle) -> Result<(usize, PathBuf, u64), CoreError> {
-    handle
+    let picked = handle
         .with_metadata(|m| {
-            m.file_infos
+            let files: Vec<(usize, String, u64)> = m
+                .file_infos
                 .iter()
                 .enumerate()
-                .map(|(i, f)| (i, f.relative_filename.clone(), f.len))
-                .filter(|(_, name, _)| is_video_name(&name.to_string_lossy()))
-                .max_by_key(|(_, _, len)| *len)
+                .map(|(i, f)| (i, f.relative_filename.to_string_lossy().into_owned(), f.len))
+                .collect();
+            choose_file_id(&files, None)
+                .and_then(|id| files.into_iter().find(|(i, _, _)| *i == id))
+                .map(|(id, name, len)| (id, PathBuf::from(name), len))
         })
-        .map_err(|e| CoreError::Other(format!("metadata no disponible: {e}")))?
-        .ok_or_else(|| CoreError::NotFound("el torrent no tiene archivos de video".into()))
+        .map_err(|e| CoreError::Other(format!("metadata no disponible: {e}")))?;
+    picked.ok_or_else(|| CoreError::NotFound("el torrent no tiene archivos de video".into()))
+}
+
+/// Devuelve la ruta local del video en el índice `idx` del torrent. `None` si
+/// `idx` no corresponde a un video válido (no-video o fuera de rango).
+pub fn pick_video_by_index(
+    handle: &ManagedTorrentHandle,
+    idx: usize,
+) -> Result<Option<PathBuf>, CoreError> {
+    handle
+        .with_metadata(|m| {
+            let files: Vec<(usize, String, u64)> = m
+                .file_infos
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.relative_filename.to_string_lossy().into_owned(), f.len))
+                .collect();
+            choose_file_id(&files, Some(idx))
+                .filter(|id| *id == idx)
+                .and_then(|id| files.into_iter().find(|(i, _, _)| *i == id))
+                .map(|(_, name, _)| PathBuf::from(name))
+        })
+        .map_err(|e| CoreError::Other(format!("metadata no disponible: {e}")))
+}
+
+/// Elige un `file_id` de video. Si `requested` apunta a un video válido, lo usa;
+/// si no (ausente, fuera de rango o no-video), cae al video de mayor `len`.
+fn choose_file_id(files: &[(usize, String, u64)], requested: Option<usize>) -> Option<usize> {
+    if let Some(idx) = requested {
+        if let Some((id, _, _)) = files
+            .iter()
+            .find(|(i, name, _)| *i == idx && is_video_name(name))
+        {
+            return Some(*id);
+        }
+    }
+    files
+        .iter()
+        .filter(|(_, name, _)| is_video_name(name))
+        .max_by_key(|(_, _, len)| *len)
+        .map(|(id, _, _)| *id)
 }
 
 fn is_video_name(name: &str) -> bool {
@@ -102,4 +145,41 @@ pub async fn torrent_stream(
         .stream(file_id)
         .await
         .map_err(|e| CoreError::Other(format!("no se pudo abrir el stream: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_file_id;
+
+    fn f(id: usize, name: &str, len: u64) -> (usize, String, u64) {
+        (id, name.to_string(), len)
+    }
+
+    #[test]
+    fn elige_el_requested_valido() {
+        let files = vec![f(0, "a.mkv", 100), f(1, "b.mp4", 900), f(2, "subs.srt", 1)];
+        assert_eq!(choose_file_id(&files, Some(0)), Some(0));
+    }
+
+    #[test]
+    fn sin_requested_elige_el_mayor() {
+        let files = vec![f(0, "a.mkv", 100), f(1, "b.mp4", 900), f(2, "c.avi", 300)];
+        assert_eq!(choose_file_id(&files, None), Some(1));
+    }
+
+    #[test]
+    fn ignora_requested_no_video_o_fuera_de_rango() {
+        let files = vec![f(0, "a.mkv", 100), f(1, "b.mp4", 900), f(2, "subs.srt", 50)];
+        // No-video: cae al mayor.
+        assert_eq!(choose_file_id(&files, Some(2)), Some(1));
+        // Fuera de rango: cae al mayor.
+        assert_eq!(choose_file_id(&files, Some(99)), Some(1));
+    }
+
+    #[test]
+    fn none_si_no_hay_videos() {
+        let files = vec![f(0, "subs.srt", 10), f(1, "readme.txt", 5)];
+        assert_eq!(choose_file_id(&files, None), None);
+        assert_eq!(choose_file_id(&files, Some(0)), None);
+    }
 }
