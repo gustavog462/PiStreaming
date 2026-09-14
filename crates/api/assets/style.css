@@ -168,6 +168,41 @@ h2.section {
 }
 input[type="number"] { font-variant-numeric: tabular-nums; }
 
+/* --- Selector de tipo (segmentado) --------------------------------------- */
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+}
+.segmented-btn {
+  appearance: none;
+  border: 0;
+  padding: 8px 14px;
+  border-radius: calc(var(--radius) - 4px);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition: color 0.15s var(--ease), background 0.15s var(--ease),
+    box-shadow 0.15s var(--ease);
+}
+.segmented-btn:hover { color: var(--text); background: var(--surface-2); }
+.segmented-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.segmented-btn.active,
+.segmented-btn[aria-pressed="true"] {
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 4px 12px var(--accent-glow);
+}
+
 /* --- Botones ------------------------------------------------------------- */
 .btn {
   display: inline-flex;
@@ -412,6 +447,8 @@ input[type="number"] { font-variant-numeric: tabular-nums; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 12px; }
   .searchbar { flex-direction: column; }
   .searchbar .btn { width: 100%; }
+  .searchbar .segmented { width: 100%; }
+  .searchbar .segmented-btn { flex: 1; }
   .player-actions .btn { flex: 1; }
   .state { padding: 36px 14px; }
   h2.section { margin-top: 22px; }

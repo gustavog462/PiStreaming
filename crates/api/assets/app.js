@@ -59,7 +59,7 @@ async function route() {
   const head = parts[0] || "search";
   app.replaceChildren(loading());
   try {
-    if (head === "search") return await viewSearch();
+    if (head === "search") return await viewSearch(parts[1]);
     if (head === "detail") return await viewDetail(parts[1], parts.slice(2).join("/"));
     if (head === "player") return await viewPlayer(parts[1]);
     if (head === "library") {
@@ -76,32 +76,85 @@ async function route() {
 }
 
 // --- Buscar ---------------------------------------------------------------
-async function viewSearch() {
+const KINDS = [
+  { id: "movie", label: "Películas" },
+  { id: "series", label: "Series" },
+];
+const KIND_LABEL = { movie: "películas", series: "series" };
+
+function normalizeKind(k) {
+  return k === "series" ? "series" : "movie";
+}
+
+// El tipo se refleja en el hash; «movie» se mantiene como #/search pelado.
+function searchHash(kind) {
+  return kind === "movie" ? "#/search" : `#/search/${kind}`;
+}
+
+async function viewSearch(rawKind) {
   setTab("search");
+  let kind = normalizeKind(rawKind);
+  const input = el("input", { name: "q", placeholder: "Buscar…" });
+  const buttons = {};
+  const applyKind = () => {
+    for (const k of KINDS) {
+      const on = k.id === kind;
+      buttons[k.id].classList.toggle("active", on);
+      buttons[k.id].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+    input.placeholder = `Buscar ${KIND_LABEL[kind]}…`;
+    // Reflejar el tipo en el hash sin recargar la vista (sobrevive reload/back).
+    const hash = searchHash(kind);
+    if (location.hash !== hash) history.replaceState(null, "", hash);
+  };
+  const chooseKind = (next) => {
+    kind = normalizeKind(next);
+    applyKind();
+    const q = input.value.trim();
+    if (q) runSearch(q, kind);
+  };
+  const segmented = el("div",
+    { class: "segmented", role: "group", "aria-label": "Tipo de búsqueda" },
+    ...KINDS.map((k) => {
+      const b = el("button", {
+        type: "button",
+        class: "segmented-btn",
+        "aria-pressed": "false",
+        onclick: () => chooseKind(k.id),
+      }, k.label);
+      buttons[k.id] = b;
+      return b;
+    }),
+  );
   const form = el("form", { class: "searchbar", onsubmit: async (e) => {
     e.preventDefault();
-    const q = e.target.q.value.trim();
-    if (q) await runSearch(q);
+    const q = input.value.trim();
+    if (q) await runSearch(q, kind);
   }},
-    el("input", { name: "q", placeholder: "Buscar películas y series…" }),
+    segmented,
+    input,
     el("button", { class: "btn primary", type: "submit" }, "Buscar"),
   );
   app.replaceChildren(el("h1", {}, "Buscar"), form,
     el("div", { id: "results", class: "grid" }));
   const last = sessionStorage.getItem("lastQuery");
-  if (last) {
-    form.querySelector("[name=q]").value = last;
-    await runSearch(last);
-  }
+  if (last) input.value = last;
+  applyKind();
+  if (last) await runSearch(last, kind);
 }
 
-async function runSearch(q) {
+let searchSeq = 0;
+async function runSearch(q, kind = "movie") {
+  kind = normalizeKind(kind);
   sessionStorage.setItem("lastQuery", q);
   const results = document.getElementById("results");
+  if (!results) return;
+  const seq = ++searchSeq;
   results.replaceChildren(loading());
-  const data = await api(`/api/search?query=${encodeURIComponent(q)}`);
+  const data = await api(`/api/search?query=${encodeURIComponent(q)}&kind=${kind}`);
+  if (seq !== searchSeq) return; // descartá respuestas obsoletas
   const metas = data.metas || [];
-  if (!metas.length) return results.replaceChildren(empty("Sin resultados"));
+  if (!metas.length) return results.replaceChildren(empty(`Sin resultados de ${KIND_LABEL[kind]}`));
   results.replaceChildren(...metas.map(metaCard));
 }
 
