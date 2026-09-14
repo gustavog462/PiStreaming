@@ -69,6 +69,26 @@ pub fn link_or_copy(src: &Path, dst: &Path) -> CoreResult<()> {
     copy_file(src, dst)
 }
 
+/// Valida un segmento (`kind` o `id`) antes de usarlo como parte del nombre de
+/// archivo en `library_dir`. Rechaza vacío, `.`, `..`, separadores de ruta y NUL
+/// para impedir path traversal.
+fn validate_name_segment(field: &str, value: &str) -> CoreResult<()> {
+    if value.is_empty() {
+        return Err(CoreError::Other(format!("{field} no puede estar vacío")));
+    }
+    if value == "." || value == ".." {
+        return Err(CoreError::Other(format!(
+            "{field} no puede ser \".\" ni \"..\""
+        )));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        return Err(CoreError::Other(format!(
+            "{field} no puede contener '/', '\\' ni NUL: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Copia `src` -> `dst` (fallback de `link_or_copy`).
 fn copy_file(src: &Path, dst: &Path) -> CoreResult<()> {
     std::fs::copy(src, dst)
@@ -176,6 +196,8 @@ impl Store {
         info_hash: Option<&str>,
         src: &Path,
     ) -> CoreResult<LibraryItem> {
+        validate_name_segment("kind", kind)?;
+        validate_name_segment("id", id)?;
         if !src.exists() {
             return Err(CoreError::NotFound(format!(
                 "archivo de origen no existe: {}",
@@ -192,12 +214,21 @@ impl Store {
             CoreError::Other(format!("no se pudo crear {}: {e}", library_dir.display()))
         })?;
         let dst = library_dir.join(format!("{full_id}.{ext}"));
-        if dst.exists() {
-            std::fs::remove_file(&dst).map_err(|e| {
-                CoreError::Other(format!("no se pudo reemplazar {}: {e}", dst.display()))
-            })?;
+        // Escritura atómica: enlaza/copia a un temporal del mismo directorio y
+        // solo entonces lo renombra sobre `dst`. Así un fallo no deja borrada la
+        // copia anterior (a diferencia del `remove_file` previo + enlace directo).
+        let tmp = dst.with_extension("tmp");
+        if let Err(e) = link_or_copy(src, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        link_or_copy(src, &dst)?;
+        if let Err(e) = std::fs::rename(&tmp, &dst) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::Other(format!(
+                "no se pudo reemplazar {}: {e}",
+                dst.display()
+            )));
+        }
         let size_bytes = std::fs::metadata(&dst)
             .map(|m| m.len() as i64)
             .map_err(|e| CoreError::Other(format!("no se pudo medir {}: {e}", dst.display())))?;
@@ -299,7 +330,7 @@ impl Store {
     pub fn library_info_hashes(&self) -> CoreResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT info_hash FROM library WHERE info_hash IS NOT NULL AND info_hash <> ''")
+            .prepare("SELECT info_hash FROM library WHERE info_hash IS NOT NULL AND info_hash <> '' ORDER BY info_hash")
             .map_err(|e| CoreError::Db(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -583,5 +614,62 @@ mod tests {
         store.keep(&library_dir, "movie", "b", "B", None, &b).unwrap();
 
         assert_eq!(store.library_info_hashes().unwrap(), vec!["hashA".to_string()]);
+    }
+
+    fn contains_evil(p: &Path) -> bool {
+        if p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("evil"))
+        {
+            return true;
+        }
+        if p.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    if contains_evil(&e.path()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn keep_rechaza_kind_id_inseguros() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let library_dir = dir.path().join("library");
+        let src = dir.path().join("src.mkv");
+        std::fs::write(&src, b"datos").unwrap();
+
+        // `id` con traversal viaja fuera de library_dir en el nombre.
+        assert!(
+            store.keep(&library_dir, "movie", "../evil", "E", None, &src).is_err(),
+            "id con traversal debe rechazarse"
+        );
+        // `kind` con traversal (el caso reportado por el oracle).
+        assert!(
+            store.keep(&library_dir, "../evil", "x", "E", None, &src).is_err(),
+            "kind con traversal debe rechazarse"
+        );
+        // `id` con separador de ruta.
+        assert!(
+            store.keep(&library_dir, "movie", "a/b", "E", None, &src).is_err(),
+            "id con '/' debe rechazarse"
+        );
+        // `kind` vacío.
+        assert!(
+            store.keep(&library_dir, "", "x", "E", None, &src).is_err(),
+            "kind vacío debe rechazarse"
+        );
+
+        // Ningún archivo se creó fuera de library_dir ni se registró la ficha.
+        assert!(
+            !contains_evil(dir.path()),
+            "no debe existir ningún archivo con 'evil' en el tempdir"
+        );
+        assert!(store.list_library().unwrap().is_empty(), "no debe registrar nada");
     }
 }
