@@ -61,7 +61,10 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/addons", get(list_addons).post(add_addon))
-        .route("/api/addons/:url", axum::routing::delete(remove_addon))
+        .route(
+            "/api/addons/:url",
+            axum::routing::delete(remove_addon).patch(patch_addon),
+        )
         .route("/api/search", get(search))
         .route("/api/meta/:kind/:id", get(meta))
         .route("/api/streams/:kind/:id", get(streams))
@@ -173,6 +176,53 @@ pub async fn remove_addon(
             Err(e) => core_err(e),
         },
         Ok(false) => err(StatusCode::NOT_FOUND, "no encontrado"),
+        Err(e) => core_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PatchAddonBody {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// PATCH /api/addons/:url { enabled? } — activa/desactiva sin borrar.
+pub async fn patch_addon(
+    State(st): State<SharedState>,
+    Path(url): Path<String>,
+    body: Result<Json<PatchAddonBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body inválido"),
+    };
+    let Some(enabled) = body.enabled else {
+        return err(StatusCode::BAD_REQUEST, "falta `enabled`");
+    };
+    let url = normalize_url(&decode_url(&url));
+    let _guard = st.mutex.lock().await;
+    if let Err(e) = st.store.set_addon_enabled(&url, enabled) {
+        return core_err(e);
+    }
+    match AddonManager::load(st.client.clone(), &st.store).await {
+        Ok(fresh) => {
+            let updated = fresh
+                .addons()
+                .iter()
+                .find(|a| a.url == url)
+                .map(|a| {
+                    serde_json::json!({
+                        "url": a.url,
+                        "name": a.manifest.name,
+                        "enabled": a.enabled,
+                    })
+                });
+            *st.addons.write().await = fresh;
+            match updated {
+                Some(v) => Json(v).into_response(),
+                None => err(StatusCode::NOT_FOUND, "no encontrado"),
+            }
+        }
         Err(e) => core_err(e),
     }
 }
@@ -944,6 +994,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn patch_addon_togglea_enabled() {
+        // El store de `test_state()` arranca vacío, así que persistimos un addon
+        // propio (con mock vivo) antes de togglear.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "org.mock.patch", "version": "1.0.0", "name": "MockPatch",
+                "resources": ["catalog"], "types": ["movie"],
+                "catalogs": [{"type": "movie", "id": "top", "extra": [{"name": "search"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let app = router(test_state().await);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/addons")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": server.uri() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        // La URL del addon se descubre desde el listado.
+        let res = app
+            .clone()
+            .oneshot(Request::get("/api/addons").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let url = rows[0]["url"].as_str().unwrap().to_string();
+        assert_eq!(rows[0]["enabled"], true);
+
+        // Desactivar sin borrar.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/addons/{}", enc(&url)))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["enabled"], false);
+
+        // Sigue listado, pero deshabilitado.
+        let res = app
+            .clone()
+            .oneshot(Request::get("/api/addons").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rows.len(), 1, "desactivar no debe borrar");
+        assert_eq!(rows[0]["enabled"], false);
+
+        // Reactivar.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/addons/{}", enc(&url)))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn patch_addon_url_desconocida_es_404() {
+        let app = router(test_state().await);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/addons/{}", enc("http://127.0.0.1:1")))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
