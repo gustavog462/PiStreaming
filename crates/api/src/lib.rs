@@ -20,6 +20,7 @@ use std::sync::Arc as StdArc;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod assets;
+pub mod library;
 pub mod range;
 pub mod session;
 pub mod settings;
@@ -80,6 +81,9 @@ pub fn router(state: SharedState) -> Router {
             "/api/settings",
             get(settings::get_settings).put(settings::put_settings),
         )
+        .route("/api/library", get(library::list).post(library::keep))
+        .route("/api/library/:id", axum::routing::delete(library::delete))
+        .route("/library/:id/stream", get(library::stream))
         .with_state(state)
 }
 
@@ -254,7 +258,7 @@ pub async fn put_progress(
     }
 }
 
-fn decode_url(s: &str) -> String {
+pub(crate) fn decode_url(s: &str) -> String {
     s.replace("%2F", "/").replace("%3A", ":")
 }
 
