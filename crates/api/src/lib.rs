@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::Arc as StdArc;
 use tokio::sync::{Mutex, RwLock};
 
+pub mod assets;
 pub mod range;
 pub mod session;
 pub mod settings;
@@ -67,7 +68,10 @@ pub fn router(state: SharedState) -> Router {
             "/api/progress/:kind/:id",
             get(get_progress).put(put_progress),
         )
-        .route("/play/:session", get(player))
+        .route("/", get(assets::index))
+        .route("/assets/*path", get(assets::asset))
+        .route("/icon.svg", get(assets::icon))
+        .route("/play/:session", get(assets::play_redirect))
         .route("/api/play/:session", get(play_plan))
         .route("/api/play", axum::routing::post(play))
         .route("/raw/:session", get(raw_stream))
@@ -252,17 +256,6 @@ pub async fn put_progress(
 
 fn decode_url(s: &str) -> String {
     s.replace("%2F", "/").replace("%3A", ":")
-}
-
-const PLAYER_HTML: &str = include_str!("../assets/player.html");
-
-/// GET /play/:session — página mínima del reproductor.
-pub async fn player(Path(_session): Path<String>) -> Response {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        PLAYER_HTML,
-    )
-        .into_response()
 }
 
 /// GET /api/play/:session — devuelve el PlaybackPlan de una sesión viva.
