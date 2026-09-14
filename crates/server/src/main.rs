@@ -172,16 +172,14 @@ async fn main() -> anyhow::Result<()> {
         library_dir: cfg.data_dir.join("library"),
     });
 
-    // Job de eviction: cada 10 min, borra sesiones inactivas fuera de TTL o que
-    // excedan CACHE_MAX_GB. Nunca toca las sesiones activas del registro.
+    // Job de eviction: cada 10 min, cierra sesiones inactivas fuera de TTL y
+    // evicta por tamaño/TTL. Lee los ajustes en caliente y nunca toca la biblioteca.
     let evict_state = state.clone();
-    let cache_max_gb = cfg.cache_max_gb;
-    let cache_ttl_hours = cfg.cache_ttl_hours;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
         loop {
             tick.tick().await;
-            if let Err(e) = evict_cache(&evict_state, cache_max_gb, cache_ttl_hours).await {
+            if let Err(e) = evict_cache(&evict_state).await {
                 tracing::warn!(error = %e, "eviction falló");
             }
         }
@@ -196,14 +194,13 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Eviction LRU por tamaño/TTL. No borra carpetas de sesiones activas.
-async fn evict_cache(
-    state: &pistreaming_api::SharedState,
-    cache_max_gb: u64,
-    cache_ttl_hours: u64,
-) -> anyhow::Result<()> {
+/// Eviction LRU por tamaño/TTL. Lee los ajustes en caliente y no borra ni las
+/// sesiones activas ni lo guardado en la biblioteca (por `info_hash`).
+async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()> {
     use std::time::{Duration, SystemTime};
 
+    let cache_max_gb = state.settings.cache_max_gb();
+    let cache_ttl_hours = state.settings.cache_ttl_hours();
     let ttl = Duration::from_secs(cache_ttl_hours * 3600);
 
     // 1) Cerrar sesiones fuera de TTL: matar su ffmpeg, sacarlas del registry y
@@ -238,8 +235,12 @@ async fn evict_cache(
     // carpeta es el `info_hash` completo; el guard debe comparar contra los
     // `info_hash` vivos (no contra `active_ids`, que llevan el hash truncado a
     // 12 chars y el file_id y por eso nunca matcheaban).
-    let active_hashes: std::collections::HashSet<String> =
+    let mut keep_hashes: std::collections::HashSet<String> =
         state.sessions.active_info_hashes().into_iter().collect();
+    match state.store.library_info_hashes() {
+        Ok(hs) => keep_hashes.extend(hs),
+        Err(e) => tracing::warn!(error = %e, "no se pudo leer library para la limpieza"),
+    }
     let root = &state.cache_dir;
     let mut dirs: Vec<(std::path::PathBuf, u64, SystemTime)> = Vec::new();
     let mut total: u64 = 0;
@@ -251,8 +252,8 @@ async fn evict_cache(
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if active_hashes.contains(&name) {
-            continue; // sesión activa
+        if keep_hashes.contains(&name) {
+            continue; // sesión activa o guardada en la biblioteca
         }
         let mut size = 0u64;
         let mut newest = SystemTime::UNIX_EPOCH;
@@ -383,7 +384,8 @@ mod tests {
         });
 
         // cache_max_gb = 0 fuerza la evicción por tamaño; TTL alto evita cerrar la viva.
-        evict_cache(&state, 0, 48).await.unwrap();
+        state.settings.set_cache_max_gb(0);
+        evict_cache(&state).await.unwrap();
 
         assert!(
             active_dir.exists(),
@@ -393,5 +395,55 @@ mod tests {
             !stale_dir.exists(),
             "la carpeta sin sesión registrada debe borrarse"
         );
+    }
+
+    /// La limpieza no debe evictar la carpeta de caché de un torrent ya guardado
+    /// en la biblioteca (se excluye por `info_hash`).
+    #[tokio::test]
+    async fn evict_cache_no_toca_lo_guardado_en_biblioteca() {
+        use super::evict_cache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = pistreaming_api::test_state(dir.path().to_path_buf());
+
+        let kept_hash = "cccccccccccccccccccccccccccccccccccccccc";
+        let cache_dir = dir.path().join(kept_hash);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let media = cache_dir.join("movie.mkv");
+        std::fs::write(&media, vec![0u8; 512]).unwrap();
+
+        state
+            .store
+            .keep(&state.library_dir, "movie", "z", "Z", Some(kept_hash), &media)
+            .unwrap();
+
+        // cache_max_gb = 0 fuerza evicción por tamaño; TTL alto evita cerrar sesiones.
+        state.settings.set_cache_max_gb(0);
+        evict_cache(&state).await.unwrap();
+
+        assert!(
+            cache_dir.exists(),
+            "la caché de algo guardado en la biblioteca no debe evictarse"
+        );
+    }
+
+    /// El evictor lee el TTL en caliente: con TTL 0 evicta una carpeta recién usada.
+    #[tokio::test]
+    async fn evict_cache_lee_el_ttl_en_caliente() {
+        use super::evict_cache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = pistreaming_api::test_state(dir.path().to_path_buf());
+
+        let hash = "dddddddddddddddddddddddddddddddddddddddd";
+        let cache_dir = dir.path().join(hash);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("f.mkv"), vec![0u8; 64]).unwrap();
+
+        state.settings.set_cache_max_gb(0);
+        state.settings.set_cache_ttl_hours(0);
+        evict_cache(&state).await.unwrap();
+
+        assert!(!cache_dir.exists(), "TTL 0 debe evictar la carpeta");
     }
 }
