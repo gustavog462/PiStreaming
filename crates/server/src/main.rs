@@ -20,6 +20,8 @@ pub struct Config {
     pub cache_max_gb: u64,
     #[serde(default = "d_cache_ttl")]
     pub cache_ttl_hours: u64,
+    #[serde(default)]
+    pub library_dir: Option<PathBuf>,
 }
 
 fn d_data_dir() -> PathBuf { PathBuf::from("/data") }
@@ -36,12 +38,13 @@ impl Default for Config {
             egress_bind: d_egress(),
             cache_max_gb: d_cache_max(),
             cache_ttl_hours: d_cache_ttl(),
+            library_dir: None,
         }
     }
 }
 
 impl Config {
-    /// Precedencia: defaults < archivo TOML < variables de entorno `PISTREAMING_*`.
+    /// Precedencia: defaults < TOML < env (canónico spec §12, con fallback legacy `PISTREAMING_*`).
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let toml_text = match path {
             Some(p) if p.exists() => Some(
@@ -54,8 +57,6 @@ impl Config {
     }
 
     /// Función pura (sin I/O ni env global): testeable y sin races.
-    // TODO(fase4): reconciliar nombres con spec §12 (hoy `PISTREAMING_*` en vez de
-    // `EGRESS_BIND` / `CACHE_TTL_HOURS` / `DATA_DIR`).
     pub fn from_sources(
         toml_text: Option<&str>,
         env: &BTreeMap<String, String>,
@@ -67,20 +68,36 @@ impl Config {
         if let Some(v) = env.get("PISTREAMING_HTTP_PORT") {
             cfg.http_port = v.parse().context("PISTREAMING_HTTP_PORT inválido")?;
         }
-        if let Some(v) = env.get("PISTREAMING_EGRESS_BIND") {
-            cfg.egress_bind = v.clone();
+        if let Some(v) = pick(env, "EGRESS_BIND", "PISTREAMING_EGRESS_BIND") {
+            cfg.egress_bind = v.to_string();
         }
-        if let Some(v) = env.get("PISTREAMING_DATA_DIR") {
+        if let Some(v) = pick(env, "DATA_DIR", "PISTREAMING_DATA_DIR") {
             cfg.data_dir = PathBuf::from(v);
         }
-        if let Some(v) = env.get("PISTREAMING_CACHE_MAX_GB") {
-            cfg.cache_max_gb = v.parse().context("PISTREAMING_CACHE_MAX_GB inválido")?;
+        if let Some(v) = pick(env, "CACHE_MAX_GB", "PISTREAMING_CACHE_MAX_GB") {
+            cfg.cache_max_gb = v.parse().context("CACHE_MAX_GB inválido")?;
         }
-        if let Some(v) = env.get("PISTREAMING_CACHE_TTL_HOURS") {
-            cfg.cache_ttl_hours = v.parse().context("PISTREAMING_CACHE_TTL_HOURS inválido")?;
+        if let Some(v) = pick(env, "CACHE_TTL_HOURS", "PISTREAMING_CACHE_TTL_HOURS") {
+            cfg.cache_ttl_hours = v.parse().context("CACHE_TTL_HOURS inválido")?;
+        }
+        // `LIBRARY_DIR` no tiene nombre legacy; si no viene en env ni TOML, deriva
+        // `<data_dir>/library` del `data_dir` ya resuelto (env > TOML > default).
+        if let Some(v) = env.get("LIBRARY_DIR") {
+            cfg.library_dir = Some(PathBuf::from(v));
+        }
+        if cfg.library_dir.is_none() {
+            cfg.library_dir = Some(cfg.data_dir.join("library"));
         }
         Ok(cfg)
     }
+}
+
+/// Resuelve una variable de entorno con el nombre canónico del spec §12,
+/// cayendo al nombre legacy `PISTREAMING_*` si el canónico no está seteado.
+fn pick<'a>(env: &'a BTreeMap<String, String>, canonical: &str, legacy: &str) -> Option<&'a str> {
+    env.get(canonical)
+        .or_else(|| env.get(legacy))
+        .map(String::as_str)
 }
 
 #[tokio::main]
@@ -93,28 +110,205 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg_path = std::env::var("PISTREAMING_CONFIG").ok().map(PathBuf::from);
+    use pistreaming_api::settings as settings_keys;
     let cfg = Config::load(cfg_path.as_deref())?;
     tracing::info!(?cfg, "config cargada");
 
     std::fs::create_dir_all(&cfg.data_dir).ok();
     let store = Store::open(&cfg.data_dir.join("pistreaming.db"))?;
 
+    let cache_max_gb = store
+        .get_setting(settings_keys::KEY_CACHE_MAX_GB)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(cfg.cache_max_gb);
+    let cache_ttl_hours = store
+        .get_setting(settings_keys::KEY_CACHE_TTL_HOURS)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(cfg.cache_ttl_hours);
+    let egress_bind = store
+        .get_setting(settings_keys::KEY_EGRESS_BIND)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| cfg.egress_bind.clone());
+    let http_port = store
+        .get_setting(settings_keys::KEY_HTTP_PORT)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(cfg.http_port);
+    if let Ok(Some(persisted)) = store.get_setting(settings_keys::KEY_DATA_DIR) {
+        if persisted != cfg.data_dir.to_string_lossy() {
+            tracing::warn!(
+                persisted = %persisted,
+                activo = %cfg.data_dir.display(),
+                "data_dir persistido no aplica en caliente; editá la config y reiniciá"
+            );
+        }
+    }
+
     let client = AddonClient::new(reqwest::Client::new());
     let mgr = AddonManager::load(client.clone(), &store).await?;
     tracing::info!(addons = mgr.addons().len(), "addons cargados");
+
+    use pistreaming_torrent::open_session;
+
+    let cache_dir = cfg.data_dir.join("cache");
+    std::fs::create_dir_all(&cache_dir).ok();
+
+    let torrent_session = open_session(cache_dir.clone(), Some(egress_bind.clone())).await?;
+    tracing::info!(bind = %egress_bind, "sesión torrent abierta");
+
+    let registry = pistreaming_api::session::PlaySessionRegistry::new();
+    let torrents_cell = tokio::sync::OnceCell::new();
+    let _ = torrents_cell.set(torrent_session);
 
     let state = Arc::new(AppState {
         store,
         client,
         addons: Arc::new(RwLock::new(mgr)),
         mutex: Mutex::new(()),
+        torrents: torrents_cell,
+        cache_dir: cache_dir.clone(),
+        public_base: format!("http://127.0.0.1:{http_port}"),
+        sessions: registry,
+        handles: parking_lot::RwLock::new(Default::default()),
+        settings: Arc::new(pistreaming_api::settings::RuntimeSettings::new(
+            cache_max_gb,
+            cache_ttl_hours,
+        )),
+        static_settings: pistreaming_api::settings::StaticSettings {
+            egress_bind: egress_bind.clone(),
+            http_port,
+            data_dir: cfg.data_dir.clone(),
+        },
+        library_dir: cfg
+            .library_dir
+            .clone()
+            .unwrap_or_else(|| cfg.data_dir.join("library")),
     });
+
+    // Job de eviction: cada 10 min, cierra sesiones inactivas fuera de TTL y
+    // evicta por tamaño/TTL. Lee los ajustes en caliente y nunca toca la biblioteca.
+    let evict_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            tick.tick().await;
+            if let Err(e) = evict_cache(&evict_state).await {
+                tracing::warn!(error = %e, "eviction falló");
+            }
+        }
+    });
+
     let app = router(state);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.http_port));
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("escuchando en http://{addr}");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Eviction LRU por tamaño/TTL. Lee los ajustes en caliente y no borra ni las
+/// sesiones activas ni lo guardado en la biblioteca (por `info_hash`).
+async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    let cache_max_gb = state.settings.cache_max_gb();
+    let cache_ttl_hours = state.settings.cache_ttl_hours();
+    let ttl = Duration::from_secs(cache_ttl_hours.saturating_mul(3600));
+
+    // 1) Cerrar sesiones fuera de TTL: matar su ffmpeg, sacarlas del registry y
+    // borrar su caché. Así una sesión que expiró deja de estar activa y la
+    // carpeta puede ser evictada por tamaño/TTL en el paso siguiente.
+    for id in state.sessions.stale_ids(ttl) {
+        let Some(s) = state.sessions.remove(&id) else {
+            continue;
+        };
+        let (cache_dir, mut child) = {
+            let mut g = s.write();
+            (g.cache_dir.clone(), g.ffmpeg.take())
+        };
+        if let Some(child) = child.as_mut() {
+            if let Err(e) = child.kill().await {
+                tracing::warn!(error = %e, session = %id, "no se pudo matar ffmpeg");
+            }
+            if let Err(e) = child.wait().await {
+                tracing::warn!(error = %e, session = %id, "no se pudo esperar ffmpeg");
+            }
+        }
+        match tokio::fs::remove_dir_all(&cache_dir).await {
+            Ok(()) => tracing::info!(dir = %cache_dir.display(), "sesión stale cerrada"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %cache_dir.display(), "no se pudo borrar caché stale")
+            }
+        }
+    }
+
+    // 2) Eviction LRU por tamaño/TTL sobre las carpetas restantes. El nombre de
+    // carpeta es el `info_hash` completo; el guard debe comparar contra los
+    // `info_hash` vivos (no contra `active_ids`, que llevan el hash truncado a
+    // 12 chars y el file_id y por eso nunca matcheaban).
+    let mut keep_hashes: std::collections::HashSet<String> =
+        state.sessions.active_info_hashes().into_iter().collect();
+    match state.store.library_info_hashes() {
+        Ok(hs) => keep_hashes.extend(hs),
+        Err(e) => tracing::warn!(error = %e, "no se pudo leer library para la limpieza"),
+    }
+    let root = &state.cache_dir;
+    let mut dirs: Vec<(std::path::PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+
+    let mut entries = tokio::fs::read_dir(root).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if keep_hashes.contains(&name) {
+            continue; // sesión activa o guardada en la biblioteca
+        }
+        let mut size = 0u64;
+        let mut newest = SystemTime::UNIX_EPOCH;
+        let mut stack = vec![path.clone()];
+        while let Some(p) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&p).await { Ok(r) => r, Err(_) => continue };
+            while let Some(f) = rd.next_entry().await.ok().flatten() {
+                let md = match f.metadata().await { Ok(m) => m, Err(_) => continue };
+                if md.is_dir() {
+                    stack.push(f.path());
+                } else {
+                    size += md.len();
+                    if let Ok(t) = md.modified() {
+                        if t > newest { newest = t; }
+                    }
+                }
+            }
+        }
+        total += size;
+        dirs.push((path, size, newest));
+    }
+
+    // Orden LRU: los más viejos primero.
+    dirs.sort_by_key(|(_, _, t)| *t);
+
+    let now = SystemTime::now();
+    for (path, size, modified) in &dirs {
+        let too_old = now.duration_since(*modified).map(|d| d > ttl).unwrap_or(false);
+        let too_big = total > cache_max_gb.saturating_mul(1024 * 1024 * 1024);
+        if too_old || too_big {
+            tracing::info!(dir = %path.display(), "evictando caché");
+            tokio::fs::remove_dir_all(path).await.ok();
+            total = total.saturating_sub(*size);
+        }
+    }
     Ok(())
 }
 
@@ -157,5 +351,170 @@ mod tests {
     fn default_ttl_matches_config_default() {
         let cfg = Config::from_sources(None, &BTreeMap::new()).unwrap();
         assert_eq!(cfg.cache_ttl_hours, 48);
+    }
+
+    #[test]
+    fn env_canonicas_del_spec_se_leen() {
+        let e = env(&[
+            ("EGRESS_BIND", "wg0"),
+            ("CACHE_TTL_HOURS", "7"),
+            ("DATA_DIR", "/mnt/datos"),
+        ]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(cfg.egress_bind, "wg0");
+        assert_eq!(cfg.cache_ttl_hours, 7);
+        assert_eq!(cfg.data_dir, std::path::PathBuf::from("/mnt/datos"));
+    }
+
+    #[test]
+    fn env_canonica_gana_sobre_legacy() {
+        let e = env(&[
+            ("CACHE_MAX_GB", "7"),
+            ("PISTREAMING_CACHE_MAX_GB", "99"),
+            ("DATA_DIR", "/canonico"),
+            ("PISTREAMING_DATA_DIR", "/legacy"),
+        ]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(cfg.cache_max_gb, 7);
+        assert_eq!(cfg.data_dir, std::path::PathBuf::from("/canonico"));
+    }
+
+    #[test]
+    fn library_dir_default_deriva_de_data_dir() {
+        // El default usa el data_dir YA resuelto (env), no el default crudo.
+        let e = env(&[("DATA_DIR", "/mnt/datos")]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(
+            cfg.library_dir.as_deref(),
+            Some(std::path::Path::new("/mnt/datos/library"))
+        );
+    }
+
+    #[test]
+    fn library_dir_explicito_gana_sobre_default() {
+        let e = env(&[("DATA_DIR", "/mnt/datos"), ("LIBRARY_DIR", "/mnt/library")]);
+        let cfg = Config::from_sources(None, &e).unwrap();
+        assert_eq!(
+            cfg.library_dir.as_deref(),
+            Some(std::path::Path::new("/mnt/library"))
+        );
+    }
+
+    /// Regresión: el guard de sesiones activas debe comparar el nombre de carpeta
+    /// (info_hash completo) contra los info_hash vivos, no contra los ids del
+    /// registry (hash truncado + file_id). Antes, la carpeta de una sesión en
+    /// reproducción se evictaba igual.
+    #[tokio::test]
+    async fn evict_cache_no_borra_sesion_activa() {
+        use super::evict_cache;
+        use pistreaming_api::session::PlaySession;
+        use pistreaming_core::playback::{PlaybackPlan, PlaybackRoute};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = pistreaming_api::test_state(dir.path().to_path_buf());
+
+        // info_hashes ficticios de 40 hex.
+        let active_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stale_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        // Mismo formato que usa el registry: hash truncado a 12 + file_id.
+        let active_id = format!("{}-0", &active_hash[..12]);
+
+        // Carpetas de caché: el nombre es el info_hash completo.
+        let active_dir = dir.path().join(active_hash);
+        let stale_dir = dir.path().join(stale_hash);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(active_dir.join("playback.mp4"), vec![0u8; 128]).unwrap();
+        std::fs::write(stale_dir.join("playback.mp4"), vec![0u8; 128]).unwrap();
+
+        let plan = PlaybackPlan {
+            session: active_id.clone(),
+            route: PlaybackRoute::Direct,
+            playback_url: format!("/stream/{active_id}"),
+            raw_url: Some(format!("/raw/{active_id}")),
+            browser_may_fail: false,
+            needs_recode_audio: false,
+            video_codec: "h264".into(),
+            audio_codec: Some("aac".into()),
+            progress_url: None,
+        };
+        state.sessions.insert(PlaySession {
+            id: active_id,
+            info_hash: active_hash.into(),
+            file_id: 0,
+            plan,
+            cache_dir: active_dir.clone(),
+            created_at: Instant::now(),
+            ffmpeg: None,
+            progress_key: None,
+            kind: None,
+            meta_id: None,
+            title: None,
+            media_path: None,
+        });
+
+        // cache_max_gb = 0 fuerza la evicción por tamaño; TTL alto evita cerrar la viva.
+        state.settings.set_cache_max_gb(0);
+        evict_cache(&state).await.unwrap();
+
+        assert!(
+            active_dir.exists(),
+            "la carpeta de la sesión activa debe sobrevivir"
+        );
+        assert!(
+            !stale_dir.exists(),
+            "la carpeta sin sesión registrada debe borrarse"
+        );
+    }
+
+    /// La limpieza no debe evictar la carpeta de caché de un torrent ya guardado
+    /// en la biblioteca (se excluye por `info_hash`).
+    #[tokio::test]
+    async fn evict_cache_no_toca_lo_guardado_en_biblioteca() {
+        use super::evict_cache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = pistreaming_api::test_state(dir.path().to_path_buf());
+
+        let kept_hash = "cccccccccccccccccccccccccccccccccccccccc";
+        let cache_dir = dir.path().join(kept_hash);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let media = cache_dir.join("movie.mkv");
+        std::fs::write(&media, vec![0u8; 512]).unwrap();
+
+        state
+            .store
+            .keep(&state.library_dir, "movie", "z", "Z", Some(kept_hash), &media)
+            .unwrap();
+
+        // cache_max_gb = 0 fuerza evicción por tamaño; TTL alto evita cerrar sesiones.
+        state.settings.set_cache_max_gb(0);
+        evict_cache(&state).await.unwrap();
+
+        assert!(
+            cache_dir.exists(),
+            "la caché de algo guardado en la biblioteca no debe evictarse"
+        );
+    }
+
+    /// El evictor lee el TTL en caliente: con TTL 0 evicta una carpeta recién usada.
+    #[tokio::test]
+    async fn evict_cache_lee_el_ttl_en_caliente() {
+        use super::evict_cache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = pistreaming_api::test_state(dir.path().to_path_buf());
+
+        let hash = "dddddddddddddddddddddddddddddddddddddddd";
+        let cache_dir = dir.path().join(hash);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("f.mkv"), vec![0u8; 64]).unwrap();
+
+        state.settings.set_cache_max_gb(0);
+        state.settings.set_cache_ttl_hours(0);
+        evict_cache(&state).await.unwrap();
+
+        assert!(!cache_dir.exists(), "TTL 0 debe evictar la carpeta");
     }
 }

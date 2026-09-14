@@ -20,7 +20,7 @@ anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.7"
 tower = "0.4"
@@ -34,3 +34,15 @@ regex = "1"
 once_cell = "1"
 tempfile = "3"
 wiremock = "0.6"
+# librqbit 9 SIN features default: `default-tls` arrastra `sha1-crypto-hash`
+# -> crypto-hash -> openssl-sys (OpenSSL nativo), que complica el cross-compile
+# a arm64/Pi. `rust-tls` usa `sha1-ring` + reqwest/rustls, sin OpenSSL nativo.
+# No se usa la feature interna `http-api` (axum 0.8). `ManagedTorrent::stream` y
+# `Session` se compilan siempre; OJO: `FileStream` no es nombrable fuera del crate
+# (ver crates/torrent/tests/api_spike.rs).
+librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+http = "1"
+rust-embed = "8"
+parking_lot = "0.12"

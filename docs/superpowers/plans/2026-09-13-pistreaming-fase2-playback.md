@@ -100,15 +100,25 @@ Expected: compila. Si falla por features de `librqbit`, inspeccionar con `cargo 
 
 ```rust
 //! Spike: confirma que la API de librqbit 9.x que asumimos existe y compila.
+//!
+//! HALLAZGO (librqbit 9.0.1): `FileStream` NO es nombrable desde fuera del crate:
+//! `librqbit::FileStream` no está re-exportado en la raíz (E0425) y
+//! `librqbit::torrent_state` es módulo privado (E0603). Por eso el chequeo de
+//! traits se hace por inferencia sobre el valor que devuelve `ManagedTorrent::stream`.
 use std::sync::Arc;
 
-#[tokio::test]
-async fn file_stream_is_reexported_and_seekable() {
-    // Si esto compila, `librqbit::FileStream` es público y cumple AsyncRead+AsyncSeek.
-    fn assert_read_seek<T: tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin>() {}
-    assert_read_seek::<librqbit::FileStream>();
+/// Compila => `ManagedTorrent::stream(Arc<Self>, usize)` existe y su salida
+/// implementa `AsyncRead + AsyncSeek + Send + Unpin`. Nunca se ejecuta (solo typecheck).
+#[allow(dead_code)]
+async fn _managed_torrent_stream_is_seekable(mt: Arc<librqbit::ManagedTorrent>) {
+    fn assert_read_seek<T: tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin>(_: T) {}
+    let stream = mt.stream(0).await.unwrap();
+    assert_read_seek(stream);
+}
 
-    // `Session` se crea con new_with_opts y devuelve Arc<Session>.
+#[tokio::test]
+async fn session_builds_and_returns_arc() {
+    // `Session::new_with_opts(PathBuf, SessionOptions) -> Arc<Session>`.
     let dir = tempfile::tempdir().unwrap();
     let session: Arc<librqbit::Session> =
         librqbit::Session::new_with_opts(dir.path().to_path_buf(), Default::default())
@@ -121,7 +131,7 @@ async fn file_stream_is_reexported_and_seekable() {
 - [ ] **Step 5: Correr el spike**
 
 Run: `cargo test -p pistreaming-torrent --test api_spike -- --nocapture`
-Expected: PASS. Si `librqbit::FileStream` no está re-exportado, usar `librqbit::torrent_state::FileStream` (ajustar el import) y anotarlo.
+Expected: PASS. Nota: `librqbit::FileStream` NO es nombrable en 9.0.1 (módulo `torrent_state` privado); el spike verifica los bounds por inferencia. La versión vigente es `crates/torrent/tests/api_spike.rs`.
 
 - [ ] **Step 6: Commit**
 
@@ -650,11 +660,21 @@ fn is_video_name(name: &str) -> bool {
         .any(|ext| n.ends_with(ext))
 }
 
-/// Abre el `FileStream` de un archivo del torrent.
+/// Abre el stream de bytes de un archivo del torrent.
+///
+/// Devuelve `impl AsyncRead + AsyncSeek + Send + Unpin + 'static` porque el tipo
+/// concreto (`librqbit::FileStream`) NO es nombrable fuera del crate
+/// (`librqbit::torrent_state` es módulo privado; lo confirmó el spike de la Task 1).
+/// Esos bounds SON el contrato: el consumidor (`api`, Tasks 6/9) los toma
+/// genéricamente. Si alguna vez hay que unificar ramas, boxear como
+/// `Box<dyn AsyncRead + AsyncSeek + Send + Unpin>` (no `Pin<Box<...>>`).
 pub async fn torrent_stream(
     handle: &ManagedTorrentHandle,
     file_id: usize,
-) -> Result<librqbit::FileStream, CoreError> {
+) -> Result<
+    impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static,
+    CoreError,
+> {
     handle
         .clone()
         .stream(file_id)
@@ -2072,3 +2092,37 @@ git commit -m "test(fase2): e2e local y docs de verificación"
 3. Presencia de `AddonManager::empty()` (Task 8); si no existe, crear el estado dentro del test con `.await`.
 4. `AddTorrentOptions` debe implementar `Default` con los campos usados (`output_folder`, `overwrite`, `initial_peers`). Confirmed en el anclaje; si `output_folder` no es `Option<PathBuf>`, ajustar el tipo.
 5. `AddTorrent::from_local_filename` (Task 5, seeder) — confirmar nombre exacto en el ancoring (existe como `from_local_filename`).
+6. Resolución de magnet offline (Task 14): librqbit resuelve metadatos **antes** de deduplicar, así que un magnet "pelado" sin DHT/trackers/peers no resuelve (`input address stream exhausted`) y `POST /api/play` da 500. El E2E usa un tracker HTTP mínimo servido por el test.
+
+---
+
+## Verificación manual en el Pi (Fase 2)
+
+No hay `README.md` en el repo, así que la verificación manual queda documentada acá.
+
+```bash
+# En el Pi (arm64):
+cargo build --release
+PISTREAMING_DATA_DIR=/data PISTREAMING_HTTP_PORT=8000 ./target/release/pistreaming
+
+# En otra terminal (o navegador) del Pi:
+# 1) arrancar una sesión con un magnet real (el Pi sí tiene DHT/egress):
+curl -s -X POST http://localhost:8000/api/play \
+  -H 'content-type: application/json' \
+  -d '{"magnet":"magnet:?xt=urn:btih:<INFO_HASH>"}'
+# -> 200 + PlaybackPlan { session, route, playback_url, ... }
+
+# 2) abrir el player y verificar comportamiento:
+#    http://localhost:8000/play/<session>
+#    - reproduce mientras baja (no espera el archivo completo),
+#    - seek/forward avanza (Range sobre el .part),
+#    - al terminar: keep -> biblioteca; si no -> se evapora del caché.
+```
+
+### Desviaciones registradas (Task 14)
+
+- **Probe blocker**: `play()` inserta el handle en `st.handles` **antes** del probe y, si `ffprobe` falla sobre la ruta local sparse, cae a `probe(&raw_url)`.
+- **`raw_stream`**: deriva el `file_id` del handle (`pick_largest_video`) en vez de `st.sessions`, para que `/raw/:session` sirva durante el probe en vuelo (la `PlaySession` todavía no está registrada).
+- **E2E (red aislada)**: el magnet declara `tr=` apuntando a un tracker HTTP mínimo levantado por el propio test, y la sesión cliente conserva DHT off pero con trackers habilitados (el magnet solo lista el tracker local). No se usó `initial_peers` porque el engine re-resuelve el magnet antes de deduplicar.
+- **Progreso del player**: el player persiste progreso cuando `POST /api/play` recibe `kind`/`id` (la URL viene en `PlaybackPlan.progress_url`); si no se envían, no se persiste (no hay deuda).
+- **`cargo fmt --check` fuera del gate**: el repo arrastra deuda de formato preexistente (63 diffs en 15 archivos). Solo se formatearon los archivos tocados; `e2e_local.rs` queda limpio. El gate efectivo es `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings`.

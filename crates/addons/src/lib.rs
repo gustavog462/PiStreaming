@@ -265,6 +265,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_manifest_acepta_url_de_manifest() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "org.test", "version": "1.0.0", "name": "Test",
+                "resources": ["catalog", "meta", "stream"],
+                "types": ["movie"],
+                "catalogs": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AddonClient::new(reqwest::Client::new());
+        // El usuario pega la URL del manifest: normalize_url debe quitar el
+        // sufijo para no pedir `/manifest.json/manifest.json`.
+        let m = client
+            .fetch_manifest(&format!("{}/manifest.json", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(m.id, "org.test");
+    }
+
+    #[tokio::test]
     async fn fetch_manifest_maps_500_to_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
