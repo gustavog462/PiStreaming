@@ -21,6 +21,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub mod range;
 pub mod session;
+pub mod settings;
 
 pub struct AppState {
     pub store: Store,
@@ -44,6 +45,12 @@ pub struct AppState {
     /// (vive en el módulo privado `torrent_state`). `ManagedTorrent` sí es público.
     pub handles:
         parking_lot::RwLock<std::collections::HashMap<String, StdArc<librqbit::ManagedTorrent>>>,
+    /// Ajustes que aplican en caliente; el evictor los lee en cada tick.
+    pub settings: StdArc<settings::RuntimeSettings>,
+    /// Valores activos de arranque para los campos que exigen reinicio.
+    pub static_settings: settings::StaticSettings,
+    /// Directorio de la biblioteca permanente (`<data_dir>/library`).
+    pub library_dir: std::path::PathBuf,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -65,17 +72,21 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/play", axum::routing::post(play))
         .route("/raw/:session", get(raw_stream))
         .route("/stream/:session", get(stream))
+        .route(
+            "/api/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
         .with_state(state)
 }
 
-fn err(code: StatusCode, msg: impl Into<String>) -> Response {
+pub(crate) fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     let body = Json(serde_json::json!({ "error": msg.into(), "code": code.as_u16() }));
     (code, body).into_response()
 }
 
 /// Mapea un `CoreError` a status HTTP, loguea el detalle y responde un mensaje
 /// genérico (no filtra SQLite/HTTP al cliente). Forma `{ error, code }` (spec §10).
-fn core_err(e: CoreError) -> Response {
+pub(crate) fn core_err(e: CoreError) -> Response {
     let (code, msg) = match &e {
         CoreError::NotFound(_) => (StatusCode::NOT_FOUND, "no encontrado"),
         CoreError::Http(_) | CoreError::Json(_) => {
@@ -570,16 +581,24 @@ pub fn test_state(dir: std::path::PathBuf) -> SharedState {
     let store = Store::open(&dir.join("pistreaming.db")).expect("store");
     let client = AddonClient::new(reqwest::Client::new());
     let addons = AddonManager::new(client.clone());
+    let library_dir = dir.join("library");
     StdArc::new(AppState {
         store,
         client,
         addons: StdArc::new(RwLock::new(addons)),
         mutex: Mutex::new(()),
         torrents: tokio::sync::OnceCell::new(),
-        cache_dir: dir,
+        cache_dir: dir.clone(),
         public_base: "http://127.0.0.1:8000".to_string(),
         sessions: PlaySessionRegistry::new(),
         handles: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        settings: StdArc::new(settings::RuntimeSettings::new(40, 48)),
+        static_settings: settings::StaticSettings {
+            egress_bind: "eth0".to_string(),
+            http_port: 8000,
+            data_dir: dir,
+        },
+        library_dir,
     })
 }
 
@@ -638,6 +657,13 @@ mod tests {
             public_base: "http://127.0.0.1:8000".to_string(),
             sessions: PlaySessionRegistry::new(),
             handles: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            settings: Arc::new(settings::RuntimeSettings::new(40, 48)),
+            static_settings: settings::StaticSettings {
+                egress_bind: "eth0".to_string(),
+                http_port: 8000,
+                data_dir: dir.path().to_path_buf(),
+            },
+            library_dir: dir.path().join("library"),
         })
     }
 
@@ -715,6 +741,13 @@ mod tests {
             public_base: "http://127.0.0.1:8000".to_string(),
             sessions: PlaySessionRegistry::new(),
             handles: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            settings: Arc::new(settings::RuntimeSettings::new(40, 48)),
+            static_settings: settings::StaticSettings {
+                egress_bind: "eth0".to_string(),
+                http_port: 8000,
+                data_dir: dir.path().to_path_buf(),
+            },
+            library_dir: dir.path().join("library"),
         }));
 
         let body = serde_json::json!({ "url": server.uri() }).to_string();

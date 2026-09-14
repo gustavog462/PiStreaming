@@ -93,11 +93,46 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg_path = std::env::var("PISTREAMING_CONFIG").ok().map(PathBuf::from);
+    use pistreaming_api::settings as settings_keys;
     let cfg = Config::load(cfg_path.as_deref())?;
     tracing::info!(?cfg, "config cargada");
 
     std::fs::create_dir_all(&cfg.data_dir).ok();
     let store = Store::open(&cfg.data_dir.join("pistreaming.db"))?;
+
+    let cache_max_gb = store
+        .get_setting(settings_keys::KEY_CACHE_MAX_GB)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(cfg.cache_max_gb);
+    let cache_ttl_hours = store
+        .get_setting(settings_keys::KEY_CACHE_TTL_HOURS)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(cfg.cache_ttl_hours);
+    let egress_bind = store
+        .get_setting(settings_keys::KEY_EGRESS_BIND)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| cfg.egress_bind.clone());
+    let http_port = store
+        .get_setting(settings_keys::KEY_HTTP_PORT)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(cfg.http_port);
+    if let Ok(Some(persisted)) = store.get_setting(settings_keys::KEY_DATA_DIR) {
+        if persisted != cfg.data_dir.to_string_lossy() {
+            tracing::warn!(
+                persisted = %persisted,
+                activo = %cfg.data_dir.display(),
+                "data_dir persistido no aplica en caliente; editá la config y reiniciá"
+            );
+        }
+    }
 
     let client = AddonClient::new(reqwest::Client::new());
     let mgr = AddonManager::load(client.clone(), &store).await?;
@@ -108,8 +143,8 @@ async fn main() -> anyhow::Result<()> {
     let cache_dir = cfg.data_dir.join("cache");
     std::fs::create_dir_all(&cache_dir).ok();
 
-    let torrent_session = open_session(cache_dir.clone(), Some(cfg.egress_bind.clone())).await?;
-    tracing::info!(bind = %cfg.egress_bind, "sesión torrent abierta");
+    let torrent_session = open_session(cache_dir.clone(), Some(egress_bind.clone())).await?;
+    tracing::info!(bind = %egress_bind, "sesión torrent abierta");
 
     let registry = pistreaming_api::session::PlaySessionRegistry::new();
     let torrents_cell = tokio::sync::OnceCell::new();
@@ -122,9 +157,19 @@ async fn main() -> anyhow::Result<()> {
         mutex: Mutex::new(()),
         torrents: torrents_cell,
         cache_dir: cache_dir.clone(),
-        public_base: format!("http://127.0.0.1:{}", cfg.http_port),
+        public_base: format!("http://127.0.0.1:{http_port}"),
         sessions: registry,
         handles: parking_lot::RwLock::new(Default::default()),
+        settings: Arc::new(pistreaming_api::settings::RuntimeSettings::new(
+            cache_max_gb,
+            cache_ttl_hours,
+        )),
+        static_settings: pistreaming_api::settings::StaticSettings {
+            egress_bind: egress_bind.clone(),
+            http_port,
+            data_dir: cfg.data_dir.clone(),
+        },
+        library_dir: cfg.data_dir.join("library"),
     });
 
     // Job de eviction: cada 10 min, borra sesiones inactivas fuera de TTL o que
@@ -144,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = router(state);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.http_port));
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("escuchando en http://{addr}");
     axum::serve(listener, app).await?;
