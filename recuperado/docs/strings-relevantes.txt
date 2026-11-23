@@ -1,0 +1,121 @@
+# Strings relevantes extraídos del binario (curados)
+
+## Variables de entorno
+
+```
+DATA_DIR
+HTTP_PORT
+EGRESS_BIND
+CACHE_MAX_GB
+CACHE_TTL_HOURS
+LIBRARY_DIR
+OPENSUBTITLES_API_KEY
+PISTREAMING_CONFIG
+RUST_LOG
+# legacy con prefijo:
+PISTREAMING_DATA_DIR
+PISTREAMING_HTTP_PORT
+PISTREAMING_EGRESS_BIND
+PISTREAMING_CACHE_MAX_GB
+PISTREAMING_CACHE_TTL_HOURS
+```
+
+## Mensajes de error / log (español)
+
+```
+no se pudo abrir la sesión restaurada
+no se pudo cuarentenar session.json; se continúa
+no se pudo persistir transcode_done
+sesión stale cerrada
+no se pudo borrar caché stale
+no se pudo leer library para la limpieza
+sin sesión de torrents; no se pudo olvidar el torrent
+no se pudo matar ffmpeg
+no se pudo esperar ffmpeg
+no se pudo pausar el torrent al olvidarlo
+no se pudo eliminar el torrent de librqbit
+no se pudo reanudar el torrent
+no se pudo crear <...>
+no se pudo escribir el subtítulo
+no se pudo abrir el stream
+no se pudo medir <...>
+no se pudo serializar la sesión
+subtítulos inexistentes
+no se pudo extraer el subtítulo
+no encontrado
+sin progreso
+body inválido
+El audio no se puede cambiar en esta fuente
+no se pudo relanzar ffmpeg tras cambio de audio
+no se pudo re-persistir el plan tras cambio de audio
+OPENSUBTITLES_API_KEY no configurada en el servidor
+conversión de subtítulo no disponible
+engine de torrents no inicializado
+disco lleno en /api/play; rechazo con 507
+no se pudo cachear el .torrent
+no se pudo resolver la metadata del torrent (¿la fuente no tiene seeds?)
+no se pudo restringir la descarga al archivo elegido
+probe falló o expiró; plan de fallback Remux
+probe excedió el presupuesto total; plan de fallback Remux
+no se pudo persistir la sesión
+metadata a tiempo
+no se pudo reanudar el torrent calentado
+torrent pre-calentado
+falta el parámetro <...>
+demasiado <...>
+no se pudo cachear el VTT
+started stream
+error updating metadata
+streams falló
+demasiado
+el transcode falló
+el transcode tardó demasiado
+ffmpeg de sesión
+no se pudo hidratar el torrent (timeout)
+error del addon upstream
+no soportado
+error interno
+request falló
+archivo no encontrado en el torrent
+torrent is not resolved
+invalid file
+```
+
+## Argumentos ffmpeg (observados)
+
+```
+-v error -y -re -probesize 1M -analyzeduration 0 -rw_timeout 15000000
+-i <raw_url>
+-map 0:v:0 -map 0:a:0?
+-c:v copy -c:a aac -b:a 192k -ac 2
+-flush_packets 1
+-movflags frag_keyframe+empty_moov+default_base_moof
+-f mp4 <cache>/<hash>/playback.mp4
+
+# recode de vídeo:
+-c:v libx264 -preset veryfast -crf <n> -maxrate <n> -bufsize <n>
+
+# subtítulos a VTT:
+ffmpeg -v error -y -i <input> -map 0:s:0 -f webvtt -
+```
+
+## MIME types
+
+```
+application/grpc-web
+image/*
+image/svg+xml
+text/event-stream
+video/mp4
+video/webm
+video/x-msvideo
+video/quicktime
+video/mp2t
+```
+
+## Notas
+
+- El binario embebe la SPA (`rust-embed`): los strings de `app.js` aparecen
+  dentro del binario.
+- No se han encontrado tokens ni claves embebidas (la API key de OpenSubtitles
+  se lee del entorno).
