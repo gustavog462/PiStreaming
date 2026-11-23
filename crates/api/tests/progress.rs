@@ -23,11 +23,18 @@ async fn put_luego_get_progreso() {
     assert_eq!(put.status(), StatusCode::NO_CONTENT);
 
     let get = app
-        .oneshot(Request::builder().uri("/api/progress/movie/tt123").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/progress/movie/tt123")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["position"], 42.5);
     assert_eq!(v["duration"], 100.0);

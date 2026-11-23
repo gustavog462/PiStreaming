@@ -15,10 +15,15 @@ async fn index_sirve_el_shell_de_la_spa() {
     assert_eq!(res.status(), StatusCode::OK);
     let ct = res.headers().get("content-type").unwrap().to_str().unwrap();
     assert!(ct.starts_with("text/html"), "content-type html: {ct}");
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let html = String::from_utf8_lossy(&body);
     assert!(html.contains("id=\"app\""), "shell con #app: {html}");
-    assert!(html.contains("/assets/app.js"), "shell enlaza app.js: {html}");
+    assert!(
+        html.contains("/assets/app.js"),
+        "shell enlaza app.js: {html}"
+    );
 }
 
 #[tokio::test]
@@ -27,7 +32,11 @@ async fn assets_sirven_css_con_su_content_type() {
     let app = pistreaming_api::router(pistreaming_api::test_state(tmp.path().to_path_buf()));
     let res = app
         .clone()
-        .oneshot(Request::get("/assets/style.css").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/assets/style.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -58,7 +67,11 @@ async fn asset_inexistente_es_404() {
     let tmp = tempfile::tempdir().unwrap();
     let app = pistreaming_api::router(pistreaming_api::test_state(tmp.path().to_path_buf()));
     let res = app
-        .oneshot(Request::get("/assets/nope.xyz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/assets/nope.xyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);

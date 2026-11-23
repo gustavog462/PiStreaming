@@ -60,8 +60,8 @@ pub struct StaticSettings {
 /// GET /api/settings — valores efectivos + qué campo exige reinicio.
 pub async fn get_settings(State(st): State<SharedState>) -> Response {
     let persisted = |key: &str| st.store.get_setting(key).ok().flatten();
-    let egress_bind = persisted(KEY_EGRESS_BIND)
-        .unwrap_or_else(|| st.static_settings.egress_bind.clone());
+    let egress_bind =
+        persisted(KEY_EGRESS_BIND).unwrap_or_else(|| st.static_settings.egress_bind.clone());
     let data_dir = persisted(KEY_DATA_DIR)
         .unwrap_or_else(|| st.static_settings.data_dir.to_string_lossy().into_owned());
     let http_port = persisted(KEY_HTTP_PORT)
@@ -189,7 +189,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["applied"], serde_json::json!(["cache_max_gb"]));
         assert_eq!(v["requires_restart"], serde_json::json!(["http_port"]));
@@ -204,7 +206,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["cache_max_gb"], 12);
         assert_eq!(v["http_port"], 9090);
@@ -228,7 +232,9 @@ mod tests {
             .await
             .unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
@@ -249,7 +255,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(
             v["error"].as_str().unwrap().contains("cache_max_gb"),

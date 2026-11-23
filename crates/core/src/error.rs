@@ -33,6 +33,9 @@ mod tests {
     #[test]
     fn unsupported_lleva_mensaje() {
         let e = CoreError::Unsupported("video codec no soportado: mpeg2video".into());
-        assert_eq!(e.to_string(), "no soportado: video codec no soportado: mpeg2video");
+        assert_eq!(
+            e.to_string(),
+            "no soportado: video codec no soportado: mpeg2video"
+        );
     }
 }

@@ -21,16 +21,14 @@ fn plan(session: &str) -> PlaybackPlan {
         needs_recode_audio: false,
         video_codec: "h264".into(),
         audio_codec: Some("aac".into()),
+        audio_tracks: vec![],
+        subtitle_tracks: vec![],
+        active_audio_index: None,
         progress_url: None,
     }
 }
 
-fn seed_library(
-    st: &pistreaming_api::SharedState,
-    kind: &str,
-    id: &str,
-    bytes: &[u8],
-) -> String {
+fn seed_library(st: &pistreaming_api::SharedState, kind: &str, id: &str, bytes: &[u8]) -> String {
     let src = st.cache_dir.join(format!("{kind}_{id}.mkv"));
     std::fs::write(&src, bytes).unwrap();
     st.store
@@ -52,7 +50,9 @@ async fn get_library_lista_y_delete_es_idempotente() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["items"][0]["id"], "movie:tt1");
     assert_eq!(v["items"][0]["size_bytes"], 10);
@@ -67,7 +67,10 @@ async fn get_library_lista_y_delete_es_idempotente() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    assert!(!std::path::Path::new(&file_path).exists(), "borra el archivo");
+    assert!(
+        !std::path::Path::new(&file_path).exists(),
+        "borra el archivo"
+    );
 
     // Idempotente: repetir sigue dando 204.
     let res = app
@@ -85,7 +88,9 @@ async fn get_library_lista_y_delete_es_idempotente() {
         .oneshot(Request::get("/api/library").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["items"], serde_json::json!([]));
 }
@@ -125,6 +130,9 @@ async fn post_library_con_descarga_incompleta_es_409() {
         meta_id: Some("tt9".into()),
         title: Some("Peli".into()),
         media_path: Some(media),
+        magnet: None,
+        transcode_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        audio_index: None,
     });
     let app = pistreaming_api::router(st);
 
@@ -207,6 +215,9 @@ async fn post_library_keep_con_handle_completo_guarda_en_library_dir() {
         meta_id: Some("ttK".into()),
         title: Some("Mi Peli".into()),
         media_path: Some(media.clone()),
+        magnet: None,
+        transcode_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        audio_index: None,
     });
 
     let app = pistreaming_api::router(st.clone());
@@ -224,7 +235,9 @@ async fn post_library_keep_con_handle_completo_guarda_en_library_dir() {
         StatusCode::CREATED,
         "keep con handle completo debe crear la ficha"
     );
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["id"], "movie:ttK", "el id es `kind:meta_id`");
     assert_eq!(v["kind"], "movie");
@@ -257,7 +270,9 @@ async fn library_stream_sirve_rango_206() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(&body[..], b"234");
 }
 

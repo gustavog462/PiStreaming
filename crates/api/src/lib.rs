@@ -20,8 +20,13 @@ use std::sync::Arc as StdArc;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod assets;
+pub mod growing;
+pub mod hls;
 pub mod library;
+pub mod media_cache;
+pub mod osdb;
 pub mod range;
+pub mod recovery;
 pub mod session;
 pub mod settings;
 
@@ -78,8 +83,26 @@ pub fn router(state: SharedState) -> Router {
         .route("/play/:session", get(assets::play_redirect))
         .route("/api/play/:session", get(play_plan))
         .route("/api/play", axum::routing::post(play))
+        .route("/api/warm", axum::routing::post(warm))
+        .route(
+            "/api/play/:session/audio",
+            axum::routing::post(switch_audio),
+        )
+        .route("/api/play/:session/subtitles/:track/raw", get(subtitle_raw))
+        .route("/subtitles/:session/:track/raw", get(subtitle_raw))
+        .route(
+            "/api/subtitles/external/:kind/:id",
+            get(list_external_subtitles)
+                .post(put_external_subtitle)
+                .put(put_external_subtitle),
+        )
+        .route(
+            "/api/subtitles/external/:kind/:id/file/:lang",
+            get(get_external_subtitle),
+        )
         .route("/raw/:session", get(raw_stream))
         .route("/stream/:session", get(stream))
+        .route("/hls/:session/*path", get(hls::serve))
         .route(
             "/api/settings",
             get(settings::get_settings).put(settings::put_settings),
@@ -206,17 +229,13 @@ pub async fn patch_addon(
     }
     match AddonManager::load(st.client.clone(), &st.store).await {
         Ok(fresh) => {
-            let updated = fresh
-                .addons()
-                .iter()
-                .find(|a| a.url == url)
-                .map(|a| {
-                    serde_json::json!({
-                        "url": a.url,
-                        "name": a.manifest.name,
-                        "enabled": a.enabled,
-                    })
-                });
+            let updated = fresh.addons().iter().find(|a| a.url == url).map(|a| {
+                serde_json::json!({
+                    "url": a.url,
+                    "name": a.manifest.name,
+                    "enabled": a.enabled,
+                })
+            });
             *st.addons.write().await = fresh;
             match updated {
                 Some(v) => Json(v).into_response(),
@@ -313,13 +332,10 @@ pub(crate) fn decode_url(s: &str) -> String {
 }
 
 /// GET /api/play/:session — devuelve el PlaybackPlan de una sesión viva.
-pub async fn play_plan(
-    State(st): State<SharedState>,
-    Path(session): Path<String>,
-) -> Response {
-    match st.sessions.get(&session) {
-        Some(s) => Json(s.read().plan.clone()).into_response(),
-        None => err(StatusCode::NOT_FOUND, "sesión desconocida"),
+pub async fn play_plan(State(st): State<SharedState>, Path(session): Path<String>) -> Response {
+    match recovery::ensure_session(&st, &session).await {
+        Ok(s) => Json(s.read().plan.clone()).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, &e),
     }
 }
 
@@ -366,6 +382,9 @@ pub struct PlayBody {
     /// Índice del archivo de video sugerido por el addon (Torrentio `fileIdx`).
     #[serde(default, rename = "fileIdx")]
     pub file_idx: Option<u32>,
+    /// Fuerza reproducción directa (sin remux/transcode) si el contenedor lo permite.
+    #[serde(default, rename = "forceDirect")]
+    pub force_direct: bool,
 }
 
 /// POST /api/play { magnet } -> PlaybackPlan
@@ -455,6 +474,19 @@ pub async fn play(
     if plan.route == PlaybackRoute::Direct {
         plan.playback_url = raw_url.clone();
     }
+    // `forceDirect`: el usuario pide saltarse remux/transcode. Solo se aplica si
+    // el contenedor es compatible con el navegador; si no, se respeta la ruta.
+    if body.force_direct && plan.route != PlaybackRoute::Direct {
+        let container_ok = p
+            .container
+            .split(',')
+            .any(|c| matches!(c.trim(), "mp4" | "mov" | "m4v" | "webm"));
+        if container_ok {
+            plan.route = PlaybackRoute::Direct;
+            plan.playback_url = raw_url.clone();
+            plan.needs_recode_audio = false;
+        }
+    }
 
     // Identidad de meta (si vino en el body) para que el player sepa dónde
     // persistir el progreso. La URL se arma con `kind`/`id` por separado: la
@@ -473,6 +505,10 @@ pub async fn play(
     });
 
     let media_path = local_probe_path(&added.handle, file_id);
+    let audio_index = plan
+        .active_audio_index
+        .and_then(|i| plan.audio_tracks.get(i))
+        .map(|t| t.index);
     st.sessions.insert(PlaySession {
         id: session_id.clone(),
         info_hash: added.info_hash.clone(),
@@ -486,9 +522,37 @@ pub async fn play(
         meta_id: body.id.clone(),
         title: body.title.clone(),
         media_path,
+        magnet: Some(body.magnet.clone()),
+        transcode_done: StdArc::new(std::sync::atomic::AtomicBool::new(false)),
+        audio_index,
     });
 
+    // Persistir para poder recuperar la sesión tras un reinicio.
+    let row = pistreaming_store::PlaySessionRow {
+        id: session_id.clone(),
+        info_hash: added.info_hash.clone(),
+        file_id: file_id as i64,
+        magnet: Some(body.magnet.clone()),
+        plan_json: serde_json::to_string(&plan).unwrap_or_default(),
+        kind: body.kind.clone(),
+        meta_id: body.id.clone(),
+        title: body.title.clone(),
+        progress_key: progress_key.clone(),
+        transcode_done: false,
+        created_at: unix_now(),
+    };
+    if let Err(e) = st.store.save_play_session(&row) {
+        tracing::warn!(error = %e, "no se pudo persistir la sesión");
+    }
+
     (StatusCode::OK, Json(plan)).into_response()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Deserialize, Default)]
@@ -506,9 +570,9 @@ pub async fn raw_stream(
     Query(q): Query<RawQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let handle = match st.handles.read().get(&session).cloned() {
-        Some(h) => h,
-        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+    let handle = match recovery::ensure_handle(&st, &session).await {
+        Ok(h) => h,
+        Err(e) => return err(StatusCode::NOT_FOUND, &e),
     };
     // Prioriza el `file_id` de la PlaySession para respetar el `fileIdx` del
     // addon. Durante el probe de `play` la sesión no existe todavía: se acepta
@@ -544,10 +608,7 @@ pub async fn stream(
     Path(session): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let handle = match st.handles.read().get(&session).cloned() {
-        Some(h) => h,
-        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
-    };
+    // Sesión en memoria o recreada desde la DB (tras un reinicio).
     let (file_id, route, is_webm) = match st.sessions.get(&session) {
         Some(s) => {
             let g = s.read();
@@ -557,11 +618,25 @@ pub async fn stream(
                 matches!(g.plan.video_codec.as_str(), "vp8" | "vp9"),
             )
         }
-        None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+        None => match recovery::ensure_session(&st, &session).await {
+            Ok(s) => {
+                let g = s.read();
+                (
+                    g.file_id,
+                    g.plan.route,
+                    matches!(g.plan.video_codec.as_str(), "vp8" | "vp9"),
+                )
+            }
+            Err(e) => return err(StatusCode::NOT_FOUND, &e),
+        },
     };
 
     match route {
         PlaybackRoute::Direct => {
+            let handle = match recovery::ensure_handle(&st, &session).await {
+                Ok(h) => h,
+                Err(e) => return err(StatusCode::NOT_FOUND, &e),
+            };
             let len = match file_len(&handle, file_id) {
                 Ok(l) => l,
                 Err(e) => return core_err(e),
@@ -574,46 +649,22 @@ pub async fn stream(
             crate::range::ranged_response(stream, len, &headers, mime).await
         }
         PlaybackRoute::Remux | PlaybackRoute::RecodeAudio => {
-            let recode = match st.sessions.get(&session) {
-                Some(s) => s.read().plan.route == PlaybackRoute::RecodeAudio,
-                None => return err(StatusCode::NOT_FOUND, "sesión desconocida"),
+            let sess = match recovery::ensure_session(&st, &session).await {
+                Ok(s) => s,
+                Err(e) => return err(StatusCode::NOT_FOUND, &e),
             };
-            // ffmpeg lee del propio `/raw` (con Range) y escribe fMP4 fragmentado
-            // a stdout. La respuesta transmite ese stdout en vivo: es de un solo
-            // consumidor y sin seek (no hay `Content-Length` final ni `Range`).
+            // ffmpeg lee del propio `/raw` (con Range) y escribe `playback.mp4`
+            // de forma progresiva; `growing` lo sirve mientras crece.
             let raw_url = format!("{}/raw/{}?file_id={}", st.public_base, session, file_id);
-            let mut child = match if recode {
-                pistreaming_media::ffmpeg::recode_audio(&raw_url)
-            } else {
-                pistreaming_media::ffmpeg::remux(&raw_url)
-            } {
-                Ok(c) => c,
+            let path = match media_cache::ensure_started(&sess, &raw_url).await {
+                Ok(p) => p,
                 Err(e) => return core_err(e),
             };
-            let stdout = match child.stdout.take() {
-                Some(s) => s,
-                None => return err(StatusCode::INTERNAL_SERVER_ERROR, "ffmpeg sin stdout"),
-            };
-            // El body es dueño de `child`: al dropearse (fin normal o corte del
-            // cliente), `kill_on_drop` mata el ffmpeg.
-            let stream = futures::stream::unfold(
-                (tokio_util::io::ReaderStream::new(stdout), child),
-                |(mut rs, child)| async move {
-                    use futures::StreamExt;
-                    rs.next().await.map(|item| (item, (rs, child)))
-                },
-            );
-            let mut resp = Response::new(axum::body::Body::from_stream(stream));
-            let h = resp.headers_mut();
-            h.insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("video/mp4"),
-            );
-            h.insert(
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-store"),
-            );
-            resp
+            let done = sess.read().transcode_done.clone();
+            if done.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = st.store.set_transcode_done(&session, true);
+            }
+            growing::serve(path, done, headers, "video/mp4").await
         }
     }
 }
@@ -646,6 +697,218 @@ fn local_probe_path(
         .ok()
         .flatten()
         .map(|rel| handle.output_folder().join(rel))
+}
+
+#[derive(Deserialize)]
+pub struct WarmBody {
+    pub info_hash: String,
+    #[serde(default)]
+    pub trackers: Vec<String>,
+    #[serde(default, rename = "fileIdx")]
+    pub file_idx: Option<u32>,
+}
+
+/// POST /api/warm — pre-calienta un torrent (conecta peers) sin reproducir.
+pub async fn warm(
+    State(st): State<SharedState>,
+    body: Result<Json<WarmBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body inválido"),
+    };
+    let session = match st.torrents.get() {
+        Some(s) => s.clone(),
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine de torrents no inicializado",
+            )
+        }
+    };
+    let mut magnet = format!("magnet:?xt=urn:btih:{}", body.info_hash);
+    for tr in &body.trackers {
+        let enc = tr.replace(':', "%3A").replace('/', "%2F");
+        magnet.push_str(&format!("&tr={enc}"));
+    }
+    match add_magnet(&session, &magnet, &st.cache_dir).await {
+        Ok(added) => {
+            st.handles
+                .write()
+                .insert(format!("warm-{}", added.info_hash), added.handle);
+            Json(serde_json::json!({ "status": "ok", "info_hash": added.info_hash }))
+                .into_response()
+        }
+        Err(e) => core_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AudioBody {
+    pub index: usize,
+}
+
+/// POST /api/play/:session/audio — cambia la pista de audio y reinicia el transcode.
+pub async fn switch_audio(
+    State(st): State<SharedState>,
+    Path(session): Path<String>,
+    body: Result<Json<AudioBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body inválido"),
+    };
+    let sess = match recovery::ensure_session(&st, &session).await {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::NOT_FOUND, &e),
+    };
+    let (route, tracks) = {
+        let g = sess.read();
+        (g.plan.route, g.plan.audio_tracks.clone())
+    };
+    if route == PlaybackRoute::Direct {
+        return err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "El audio no se puede cambiar en esta fuente",
+        );
+    }
+    let Some(track) = tracks.get(body.index) else {
+        return err(StatusCode::BAD_REQUEST, "pista de audio inválida");
+    };
+    media_cache::reset(&sess).await;
+    hls::stop(&session);
+    let cache_dir = sess.read().cache_dir.clone();
+    let _ = tokio::fs::remove_dir_all(hls::hls_dir(&cache_dir)).await;
+    let plan = {
+        let mut g = sess.write();
+        g.audio_index = Some(track.index);
+        g.plan.active_audio_index = Some(body.index);
+        g.plan.clone()
+    };
+    if let Ok(Some(mut row)) = st.store.get_play_session(&session) {
+        row.plan_json = serde_json::to_string(&plan).unwrap_or_default();
+        let _ = st.store.save_play_session(&row);
+    }
+    Json(plan).into_response()
+}
+
+/// GET /api/play/:session/subtitles/:track/raw — extrae un subtítulo embebido a VTT.
+pub async fn subtitle_raw(
+    State(st): State<SharedState>,
+    Path((session, track)): Path<(String, String)>,
+) -> Response {
+    let sess = match recovery::ensure_session(&st, &session).await {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::NOT_FOUND, &e),
+    };
+    let (file_id, track_index) = {
+        let g = sess.read();
+        (g.file_id, track.parse::<usize>().ok())
+    };
+    let Some(track_index) = track_index else {
+        return err(StatusCode::BAD_REQUEST, "pista inválida");
+    };
+    let raw_url = format!("{}/raw/{}?file_id={}", st.public_base, session, file_id);
+    let out = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            &raw_url,
+            "-map",
+            &format!("0:{track_index}"),
+            "-f",
+            "webvtt",
+            "-",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let mut resp = Response::new(axum::body::Body::from(o.stdout));
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/vtt; charset=utf-8"),
+            );
+            resp
+        }
+        Ok(o) => {
+            tracing::warn!(
+                error = %String::from_utf8_lossy(&o.stderr),
+                "no se pudo extraer el subtítulo"
+            );
+            err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no se pudo extraer el subtítulo",
+            )
+        }
+        Err(e) => core_err(CoreError::Other(format!("ffmpeg no ejecutable: {e}"))),
+    }
+}
+
+/// GET /api/subtitles/external/:kind/:id — idiomas disponibles en OpenSubtitles.
+pub async fn list_external_subtitles(
+    State(_st): State<SharedState>,
+    Path((_kind, id)): Path<(String, String)>,
+) -> Response {
+    match osdb::languages(&id).await {
+        Ok(langs) => Json(serde_json::json!({ "languages": langs })).into_response(),
+        // Sin API key: lista vacía (la SPA no muestra la sección online).
+        Err(CoreError::Unsupported(_)) => {
+            Json(serde_json::json!({ "languages": [] })).into_response()
+        }
+        Err(e) => core_err(e),
+    }
+}
+
+/// PUT/POST /api/subtitles/external/:kind/:id { lang } — descarga el mejor
+/// subtítulo (auto: es → en → cualquiera), lo cachea y devuelve el idioma.
+pub async fn put_external_subtitle(
+    State(st): State<SharedState>,
+    Path((kind, id)): Path<(String, String)>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Json(v) = match body {
+        Ok(b) => b,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body inválido"),
+    };
+    let lang = v.get("lang").and_then(|x| x.as_str()).unwrap_or("auto");
+    match osdb::download_auto(&id, lang).await {
+        Ok((vtt, actual)) => {
+            let dir = st.cache_dir.join("subtitles");
+            std::fs::create_dir_all(&dir).ok();
+            let _ = std::fs::write(dir.join(format!("{kind}:{id}.{actual}.vtt")), &vtt);
+            Json(serde_json::json!({ "language": actual })).into_response()
+        }
+        Err(e) => core_err(e),
+    }
+}
+
+/// GET /api/subtitles/external/:kind/:id/file/:lang — sirve el VTT (cache o descarga).
+pub async fn get_external_subtitle(
+    State(st): State<SharedState>,
+    Path((kind, id, lang)): Path<(String, String, String)>,
+) -> Response {
+    let dir = st.cache_dir.join("subtitles");
+    let path = dir.join(format!("{kind}:{id}.{lang}.vtt"));
+    let vtt = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => match osdb::download_auto(&id, &lang).await {
+            Ok((vtt, actual)) => {
+                std::fs::create_dir_all(&dir).ok();
+                let _ = std::fs::write(dir.join(format!("{kind}:{id}.{actual}.vtt")), &vtt);
+                vtt
+            }
+            Err(e) => return core_err(e),
+        },
+    };
+    let mut resp = Response::new(axum::body::Body::from(vtt));
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/vtt; charset=utf-8"),
+    );
+    resp
 }
 
 fn uuid_like(info_hash: &str, file_id: usize) -> String {
@@ -1170,7 +1433,10 @@ mod tests {
 
     #[test]
     fn x_forwarded_proto_manda_el_esquema() {
-        let h = headers_with(&[("host", "stream.example:443"), ("x-forwarded-proto", "https")]);
+        let h = headers_with(&[
+            ("host", "stream.example:443"),
+            ("x-forwarded-proto", "https"),
+        ]);
         assert_eq!(
             base_from_headers(&h, "http://127.0.0.1:8000"),
             "https://stream.example:443"

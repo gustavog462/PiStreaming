@@ -59,16 +59,25 @@ pub async fn keep(
         );
     };
     let title = title.unwrap_or_else(|| id.clone());
-    let info_hash_opt = if info_hash.is_empty() { None } else { Some(info_hash) };
+    let info_hash_opt = if info_hash.is_empty() {
+        None
+    } else {
+        Some(info_hash)
+    };
 
-    match st
-        .store
-        .keep(&st.library_dir, &kind, &id, &title, info_hash_opt.as_deref(), &media_path)
-    {
+    match st.store.keep(
+        &st.library_dir,
+        &kind,
+        &id,
+        &title,
+        info_hash_opt.as_deref(),
+        &media_path,
+    ) {
         Ok(item) => (StatusCode::CREATED, Json(item)).into_response(),
-        Err(CoreError::NotFound(_)) => {
-            crate::err(StatusCode::CONFLICT, "el archivo de la sesión no está disponible")
-        }
+        Err(CoreError::NotFound(_)) => crate::err(
+            StatusCode::CONFLICT,
+            "el archivo de la sesión no está disponible",
+        ),
         Err(e) => crate::core_err(e),
     }
 }

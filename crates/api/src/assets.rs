@@ -52,8 +52,10 @@ fn serve(path: &str) -> Option<Response> {
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
-    resp.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control(path)));
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control(path)),
+    );
     Some(resp)
 }
 
@@ -82,8 +84,14 @@ mod tests {
 
     #[test]
     fn index_e_icon_estan_embebidos() {
-        assert!(Assets::get("index.html").is_some(), "falta crates/api/assets/index.html");
-        assert!(Assets::get("icon.svg").is_some(), "falta crates/api/assets/icon.svg");
+        assert!(
+            Assets::get("index.html").is_some(),
+            "falta crates/api/assets/index.html"
+        );
+        assert!(
+            Assets::get("icon.svg").is_some(),
+            "falta crates/api/assets/icon.svg"
+        );
     }
 
     #[test]

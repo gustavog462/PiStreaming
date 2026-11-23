@@ -1,6 +1,7 @@
 //! Registro en memoria de sesiones de reproducción activas.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,12 @@ pub struct PlaySession {
     pub title: Option<String>,
     /// Ruta local del `.mkv`/`.mp4` final dentro de la caché de librqbit.
     pub media_path: Option<std::path::PathBuf>,
+    /// Magnet original (para recuperar la sesión tras un reinicio).
+    pub magnet: Option<String>,
+    /// `true` cuando el transcode progresivo a `playback.mp4` ha terminado.
+    pub transcode_done: Arc<AtomicBool>,
+    /// Índice del stream de audio activo (índice ffprobe, no posición en la lista).
+    pub audio_index: Option<usize>,
 }
 
 #[derive(Default)]
@@ -104,6 +111,9 @@ mod tests {
             needs_recode_audio: false,
             video_codec: "h264".into(),
             audio_codec: Some("aac".into()),
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            active_audio_index: None,
             progress_url: None,
         }
     }
@@ -122,6 +132,9 @@ mod tests {
             meta_id: None,
             title: None,
             media_path: None,
+            magnet: None,
+            transcode_done: Arc::new(AtomicBool::new(false)),
+            audio_index: None,
         }
     }
 

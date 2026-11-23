@@ -24,11 +24,21 @@ pub struct Config {
     pub library_dir: Option<PathBuf>,
 }
 
-fn d_data_dir() -> PathBuf { PathBuf::from("/data") }
-fn d_http_port() -> u16 { 8000 }
-fn d_egress() -> String { "eth0".into() }
-fn d_cache_max() -> u64 { 40 }
-fn d_cache_ttl() -> u64 { 48 }
+fn d_data_dir() -> PathBuf {
+    PathBuf::from("/data")
+}
+fn d_http_port() -> u16 {
+    8000
+}
+fn d_egress() -> String {
+    "eth0".into()
+}
+fn d_cache_max() -> u64 {
+    40
+}
+fn d_cache_ttl() -> u64 {
+    48
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -104,8 +114,7 @@ fn pick<'a>(env: &'a BTreeMap<String, String>, canonical: &str, legacy: &str) ->
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -192,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| cfg.data_dir.join("library")),
     });
 
+    // Recuperar sesiones persistidas (best effort) y podar las caducadas.
+    pistreaming_api::recovery::load_at_boot(&state).await;
+    pistreaming_api::recovery::prune(&state, (cache_ttl_hours as i64).saturating_mul(3600));
+
     // Job de eviction: cada 10 min, cierra sesiones inactivas fuera de TTL y
     // evicta por tamaño/TTL. Lee los ajustes en caliente y nunca toca la biblioteca.
     let evict_state = state.clone();
@@ -242,6 +255,10 @@ async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()>
                 tracing::warn!(error = %e, session = %id, "no se pudo esperar ffmpeg");
             }
         }
+        pistreaming_api::hls::stop(&id);
+        if let Err(e) = state.store.delete_play_session(&id) {
+            tracing::warn!(error = %e, session = %id, "no se pudo borrar la sesión persistida");
+        }
         match tokio::fs::remove_dir_all(&cache_dir).await {
             Ok(()) => tracing::info!(dir = %cache_dir.display(), "sesión stale cerrada"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -279,15 +296,23 @@ async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()>
         let mut newest = SystemTime::UNIX_EPOCH;
         let mut stack = vec![path.clone()];
         while let Some(p) = stack.pop() {
-            let mut rd = match tokio::fs::read_dir(&p).await { Ok(r) => r, Err(_) => continue };
+            let mut rd = match tokio::fs::read_dir(&p).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             while let Some(f) = rd.next_entry().await.ok().flatten() {
-                let md = match f.metadata().await { Ok(m) => m, Err(_) => continue };
+                let md = match f.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
                 if md.is_dir() {
                     stack.push(f.path());
                 } else {
                     size += md.len();
                     if let Ok(t) = md.modified() {
-                        if t > newest { newest = t; }
+                        if t > newest {
+                            newest = t;
+                        }
                     }
                 }
             }
@@ -301,7 +326,10 @@ async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()>
 
     let now = SystemTime::now();
     for (path, size, modified) in &dirs {
-        let too_old = now.duration_since(*modified).map(|d| d > ttl).unwrap_or(false);
+        let too_old = now
+            .duration_since(*modified)
+            .map(|d| d > ttl)
+            .unwrap_or(false);
         let too_big = total > cache_max_gb.saturating_mul(1024 * 1024 * 1024);
         if too_old || too_big {
             tracing::info!(dir = %path.display(), "evictando caché");
@@ -318,12 +346,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn env_overrides_defaults() {
-        let e = env(&[("PISTREAMING_HTTP_PORT", "9999"), ("PISTREAMING_EGRESS_BIND", "wg0")]);
+        let e = env(&[
+            ("PISTREAMING_HTTP_PORT", "9999"),
+            ("PISTREAMING_EGRESS_BIND", "wg0"),
+        ]);
         let cfg = Config::from_sources(None, &e).unwrap();
         assert_eq!(cfg.http_port, 9999);
         assert_eq!(cfg.egress_bind, "wg0");
@@ -437,6 +471,9 @@ mod tests {
             needs_recode_audio: false,
             video_codec: "h264".into(),
             audio_codec: Some("aac".into()),
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            active_audio_index: None,
             progress_url: None,
         };
         state.sessions.insert(PlaySession {
@@ -452,6 +489,9 @@ mod tests {
             meta_id: None,
             title: None,
             media_path: None,
+            magnet: None,
+            transcode_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            audio_index: None,
         });
 
         // cache_max_gb = 0 fuerza la evicción por tamaño; TTL alto evita cerrar la viva.
@@ -485,7 +525,14 @@ mod tests {
 
         state
             .store
-            .keep(&state.library_dir, "movie", "z", "Z", Some(kept_hash), &media)
+            .keep(
+                &state.library_dir,
+                "movie",
+                "z",
+                "Z",
+                Some(kept_hash),
+                &media,
+            )
             .unwrap();
 
         // cache_max_gb = 0 fuerza evicción por tamaño; TTL alto evita cerrar sesiones.

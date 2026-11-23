@@ -107,7 +107,11 @@ mod tests {
         }"#;
         let m: Manifest = serde_json::from_str(raw).unwrap();
         match &m.resources[0] {
-            Resource::Full { name, types, id_prefixes } => {
+            Resource::Full {
+                name,
+                types,
+                id_prefixes,
+            } => {
                 assert_eq!(name, "catalog");
                 assert_eq!(types, &vec!["movie".to_string()]);
                 assert_eq!(id_prefixes.as_deref(), Some(&["tt".to_string()][..]));

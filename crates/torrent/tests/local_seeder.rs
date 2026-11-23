@@ -62,7 +62,9 @@ async fn descarga_de_un_seeder_local() {
         .await
         .unwrap();
 
-    let addr: SocketAddr = seeder.listen_addr().expect("el seeder debe tener listener local");
+    let addr: SocketAddr = seeder
+        .listen_addr()
+        .expect("el seeder debe tener listener local");
     let opts = AddTorrentOptions {
         output_folder: Some(client_dir.to_string_lossy().into_owned()),
         overwrite: true,

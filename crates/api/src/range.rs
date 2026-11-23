@@ -20,21 +20,31 @@ pub enum RangeOutcome {
 
 /// Parsea `Range: bytes=...` contra un largo conocido. Pura.
 pub fn parse_range(header_value: Option<&str>, len: u64) -> RangeOutcome {
-    let Some(v) = header_value else { return RangeOutcome::Full };
-    let Some(spec) = v.trim().strip_prefix("bytes=") else { return RangeOutcome::Invalid };
-    let Some((s, e)) = spec.split_once('-') else { return RangeOutcome::Invalid };
+    let Some(v) = header_value else {
+        return RangeOutcome::Full;
+    };
+    let Some(spec) = v.trim().strip_prefix("bytes=") else {
+        return RangeOutcome::Invalid;
+    };
+    let Some((s, e)) = spec.split_once('-') else {
+        return RangeOutcome::Invalid;
+    };
     if len == 0 {
         return RangeOutcome::Invalid;
     }
     let (start, end_excl) = if s.is_empty() {
         // sufijo: bytes=-N (últimos N)
-        let Ok(n) = e.trim().parse::<u64>() else { return RangeOutcome::Invalid };
+        let Ok(n) = e.trim().parse::<u64>() else {
+            return RangeOutcome::Invalid;
+        };
         if n == 0 {
             return RangeOutcome::Invalid;
         }
         (len.saturating_sub(n), len)
     } else {
-        let Ok(start) = s.trim().parse::<u64>() else { return RangeOutcome::Invalid };
+        let Ok(start) = s.trim().parse::<u64>() else {
+            return RangeOutcome::Invalid;
+        };
         let end_excl = if e.trim().is_empty() {
             len
         } else {
@@ -64,7 +74,10 @@ where
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    resp_headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(mime).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
 
     match parse_range(range, len) {
         RangeOutcome::Invalid => {
@@ -108,24 +121,45 @@ mod tests {
 
     #[test]
     fn rango_abierto() {
-        assert_eq!(parse_range(Some("bytes=10-"), 100), RangeOutcome::Partial { start: 10, end_excl: 100 });
+        assert_eq!(
+            parse_range(Some("bytes=10-"), 100),
+            RangeOutcome::Partial {
+                start: 10,
+                end_excl: 100
+            }
+        );
     }
 
     #[test]
     fn rango_cerrado_es_inclusivo_en_origen() {
         // bytes=0-4 => 5 bytes (end exclusivo 5)
-        assert_eq!(parse_range(Some("bytes=0-4"), 100), RangeOutcome::Partial { start: 0, end_excl: 5 });
+        assert_eq!(
+            parse_range(Some("bytes=0-4"), 100),
+            RangeOutcome::Partial {
+                start: 0,
+                end_excl: 5
+            }
+        );
     }
 
     #[test]
     fn sufijo() {
-        assert_eq!(parse_range(Some("bytes=-20"), 100), RangeOutcome::Partial { start: 80, end_excl: 100 });
+        assert_eq!(
+            parse_range(Some("bytes=-20"), 100),
+            RangeOutcome::Partial {
+                start: 80,
+                end_excl: 100
+            }
+        );
     }
 
     #[test]
     fn fuera_de_rango_es_invalid() {
         assert_eq!(parse_range(Some("bytes=100-"), 100), RangeOutcome::Invalid);
-        assert_eq!(parse_range(Some("bytes=0-1000"), 100), RangeOutcome::Invalid);
+        assert_eq!(
+            parse_range(Some("bytes=0-1000"), 100),
+            RangeOutcome::Invalid
+        );
     }
 
     #[test]

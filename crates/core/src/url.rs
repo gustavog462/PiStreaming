@@ -30,8 +30,14 @@ mod tests {
 
     #[test]
     fn strips_manifest_suffix() {
-        assert_eq!(normalize_url("https://x.test/manifest.json"), "https://x.test");
-        assert_eq!(normalize_url("https://x.test/manifest.json/"), "https://x.test");
+        assert_eq!(
+            normalize_url("https://x.test/manifest.json"),
+            "https://x.test"
+        );
+        assert_eq!(
+            normalize_url("https://x.test/manifest.json/"),
+            "https://x.test"
+        );
         assert_eq!(
             normalize_url("https://x.test/base/manifest.json"),
             "https://x.test/base"

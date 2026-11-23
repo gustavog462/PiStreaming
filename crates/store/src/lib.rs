@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS library (
   info_hash   TEXT,
   created_at  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS play_sessions (
+  id             TEXT PRIMARY KEY,
+  info_hash      TEXT NOT NULL,
+  file_id        INTEGER NOT NULL,
+  magnet         TEXT,
+  plan_json      TEXT NOT NULL,
+  kind           TEXT,
+  meta_id        TEXT,
+  title          TEXT,
+  progress_key   TEXT,
+  transcode_done INTEGER NOT NULL DEFAULT 0,
+  created_at     INTEGER NOT NULL
+);
 "#;
 
 /// Una entrada de la biblioteca permanente (spec §4.1).
@@ -57,6 +70,22 @@ pub struct LibraryItem {
     /// `info_hash` del torrent origen, para que la limpieza no toque lo guardado.
     pub info_hash: Option<String>,
     /// Segundos Unix.
+    pub created_at: i64,
+}
+
+/// Fila persistida de una sesión de reproducción (para recuperarla al arrancar).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaySessionRow {
+    pub id: String,
+    pub info_hash: String,
+    pub file_id: i64,
+    pub magnet: Option<String>,
+    pub plan_json: String,
+    pub kind: Option<String>,
+    pub meta_id: Option<String>,
+    pub title: Option<String>,
+    pub progress_key: Option<String>,
+    pub transcode_done: bool,
     pub created_at: i64,
 }
 
@@ -91,13 +120,13 @@ fn validate_name_segment(field: &str, value: &str) -> CoreResult<()> {
 
 /// Copia `src` -> `dst` (fallback de `link_or_copy`).
 fn copy_file(src: &Path, dst: &Path) -> CoreResult<()> {
-    std::fs::copy(src, dst)
-        .map(|_| ())
-        .map_err(|e| CoreError::Other(format!(
+    std::fs::copy(src, dst).map(|_| ()).map_err(|e| {
+        CoreError::Other(format!(
             "no se pudo copiar {} -> {}: {e}",
             src.display(),
             dst.display()
-        )))
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +149,9 @@ impl Store {
             .map_err(|e| CoreError::Db(e.to_string()))?;
         conn.execute_batch(MIGRATIONS)
             .map_err(|e| CoreError::Db(e.to_string()))?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn add_addon(&self, url: &str, manifest: &Manifest) -> CoreResult<()> {
@@ -158,7 +189,13 @@ impl Store {
             let (url, manifest_json, name, enabled, position) =
                 r.map_err(|e| CoreError::Db(e.to_string()))?;
             let manifest: Manifest = serde_json::from_str(&manifest_json)?;
-            out.push(AddonRow { url, manifest, name, enabled: enabled != 0, position });
+            out.push(AddonRow {
+                url,
+                manifest,
+                name,
+                enabled: enabled != 0,
+                position,
+            });
         }
         Ok(out)
     }
@@ -305,7 +342,9 @@ impl Store {
             let mut stmt = conn
                 .prepare("SELECT file_path FROM library WHERE id = ?1")
                 .map_err(|e| CoreError::Db(e.to_string()))?;
-            let mut rows = stmt.query(params![id]).map_err(|e| CoreError::Db(e.to_string()))?;
+            let mut rows = stmt
+                .query(params![id])
+                .map_err(|e| CoreError::Db(e.to_string()))?;
             match rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
                 Some(row) => Some(row.get(0).map_err(|e| CoreError::Db(e.to_string()))?),
                 None => None,
@@ -315,9 +354,7 @@ impl Store {
             match std::fs::remove_file(p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(CoreError::Other(format!("no se pudo borrar {p}: {e}")))
-                }
+                Err(e) => return Err(CoreError::Other(format!("no se pudo borrar {p}: {e}"))),
             }
         }
         let conn = self.conn.lock().unwrap();
@@ -347,7 +384,9 @@ impl Store {
         let mut stmt = conn
             .prepare("SELECT value FROM settings WHERE key = ?1")
             .map_err(|e| CoreError::Db(e.to_string()))?;
-        let mut rows = stmt.query(params![key]).map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![key])
+            .map_err(|e| CoreError::Db(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
             Ok(Some(row.get(0).map_err(|e| CoreError::Db(e.to_string()))?))
         } else {
@@ -384,7 +423,9 @@ impl Store {
         let mut stmt = conn
             .prepare("SELECT position, duration FROM progress WHERE id = ?1")
             .map_err(|e| CoreError::Db(e.to_string()))?;
-        let mut rows = stmt.query(params![id]).map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![id])
+            .map_err(|e| CoreError::Db(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
             let pos: f64 = row.get(0).map_err(|e| CoreError::Db(e.to_string()))?;
             let dur: Option<f64> = row.get(1).map_err(|e| CoreError::Db(e.to_string()))?;
@@ -410,14 +451,143 @@ impl Store {
     pub fn get_metadata_cache(&self, key: &str) -> CoreResult<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT json FROM metadata_cache WHERE key = ?1 AND expires_at > datetime('now')")
+            .prepare(
+                "SELECT json FROM metadata_cache WHERE key = ?1 AND expires_at > datetime('now')",
+            )
             .map_err(|e| CoreError::Db(e.to_string()))?;
-        let mut rows = stmt.query(params![key]).map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![key])
+            .map_err(|e| CoreError::Db(e.to_string()))?;
         if let Some(row) = rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
             Ok(Some(row.get(0).map_err(|e| CoreError::Db(e.to_string()))?))
         } else {
             Ok(None)
         }
+    }
+
+    /// Persiste (upsert) una sesión de reproducción para recuperarla al arrancar.
+    pub fn save_play_session(&self, row: &PlaySessionRow) -> CoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO play_sessions
+               (id, info_hash, file_id, magnet, plan_json, kind, meta_id, title,
+                progress_key, transcode_done, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET info_hash = excluded.info_hash,
+                                           file_id = excluded.file_id,
+                                           magnet = excluded.magnet,
+                                           plan_json = excluded.plan_json,
+                                           kind = excluded.kind,
+                                           meta_id = excluded.meta_id,
+                                           title = excluded.title,
+                                           progress_key = excluded.progress_key,
+                                           transcode_done = excluded.transcode_done",
+            params![
+                row.id,
+                row.info_hash,
+                row.file_id,
+                row.magnet,
+                row.plan_json,
+                row.kind,
+                row.meta_id,
+                row.title,
+                row.progress_key,
+                row.transcode_done as i64,
+                row.created_at
+            ],
+        )
+        .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    fn play_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlaySessionRow> {
+        Ok(PlaySessionRow {
+            id: row.get(0)?,
+            info_hash: row.get(1)?,
+            file_id: row.get(2)?,
+            magnet: row.get(3)?,
+            plan_json: row.get(4)?,
+            kind: row.get(5)?,
+            meta_id: row.get(6)?,
+            title: row.get(7)?,
+            progress_key: row.get(8)?,
+            transcode_done: row.get::<_, i64>(9)? != 0,
+            created_at: row.get(10)?,
+        })
+    }
+
+    /// Lista las sesiones persistidas, más recientes primero.
+    pub fn list_play_sessions(&self) -> CoreResult<Vec<PlaySessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, info_hash, file_id, magnet, plan_json, kind, meta_id,
+                        title, progress_key, transcode_done, created_at
+                 FROM play_sessions ORDER BY created_at DESC, id",
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map([], Self::play_session_from_row)
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| CoreError::Db(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_play_session(&self, id: &str) -> CoreResult<Option<PlaySessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, info_hash, file_id, magnet, plan_json, kind, meta_id,
+                        title, progress_key, transcode_done, created_at
+                 FROM play_sessions WHERE id = ?1",
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![id])
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        match rows.next().map_err(|e| CoreError::Db(e.to_string()))? {
+            Some(row) => Ok(Some(
+                Self::play_session_from_row(row).map_err(|e| CoreError::Db(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_play_session(&self, id: &str) -> CoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM play_sessions WHERE id = ?1", params![id])
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn set_transcode_done(&self, id: &str, done: bool) -> CoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE play_sessions SET transcode_done = ?1 WHERE id = ?2",
+            params![done as i64, id],
+        )
+        .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Borra sesiones más viejas que `max_age_secs` (segundos Unix).
+    pub fn prune_play_sessions(&self, max_age_secs: i64) -> CoreResult<usize> {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            .saturating_sub(max_age_secs);
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "DELETE FROM play_sessions WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(n)
     }
 }
 
@@ -468,8 +638,12 @@ mod tests {
     fn adding_same_url_upserts() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.db")).unwrap();
-        store.add_addon("https://a.test", &manifest("org.a", "Old")).unwrap();
-        store.add_addon("https://a.test", &manifest("org.a", "New")).unwrap();
+        store
+            .add_addon("https://a.test", &manifest("org.a", "Old"))
+            .unwrap();
+        store
+            .add_addon("https://a.test", &manifest("org.a", "New"))
+            .unwrap();
         let rows = store.list_addons().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "New");
@@ -481,16 +655,24 @@ mod tests {
         let store = Store::open(&dir.path().join("t.db")).unwrap();
         assert_eq!(store.get_setting("egress_bind").unwrap(), None);
         store.set_setting("egress_bind", "eth0").unwrap();
-        assert_eq!(store.get_setting("egress_bind").unwrap().as_deref(), Some("eth0"));
+        assert_eq!(
+            store.get_setting("egress_bind").unwrap().as_deref(),
+            Some("eth0")
+        );
         store.set_setting("egress_bind", "wg0").unwrap();
-        assert_eq!(store.get_setting("egress_bind").unwrap().as_deref(), Some("wg0"));
+        assert_eq!(
+            store.get_setting("egress_bind").unwrap().as_deref(),
+            Some("wg0")
+        );
     }
 
     #[test]
     fn progress_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.db")).unwrap();
-        store.save_progress("tt1160419", 1234.5, Some(9300.0)).unwrap();
+        store
+            .save_progress("tt1160419", 1234.5, Some(9300.0))
+            .unwrap();
         let p = store.get_progress("tt1160419").unwrap().unwrap();
         assert_eq!(p.0, 1234.5);
         assert_eq!(p.1, Some(9300.0));
@@ -500,9 +682,16 @@ mod tests {
     fn metadata_cache_hits_then_expires() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.db")).unwrap();
-        store.put_metadata_cache("meta:tt100", r#"{"a":1}"#, 3600).unwrap();
-        assert_eq!(store.get_metadata_cache("meta:tt100").unwrap().as_deref(), Some(r#"{"a":1}"#));
-        store.put_metadata_cache("meta:tt101", r#"{"b":2}"#, -1).unwrap();
+        store
+            .put_metadata_cache("meta:tt100", r#"{"a":1}"#, 3600)
+            .unwrap();
+        assert_eq!(
+            store.get_metadata_cache("meta:tt100").unwrap().as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        store
+            .put_metadata_cache("meta:tt101", r#"{"b":2}"#, -1)
+            .unwrap();
         assert_eq!(store.get_metadata_cache("meta:tt101").unwrap(), None);
     }
 
@@ -545,7 +734,14 @@ mod tests {
         std::fs::write(&src, vec![7u8; 1024]).unwrap();
 
         let item = store
-            .keep(&library_dir, "movie", "bbb-2014", "Beauty", Some("hash1"), &src)
+            .keep(
+                &library_dir,
+                "movie",
+                "bbb-2014",
+                "Beauty",
+                Some("hash1"),
+                &src,
+            )
             .unwrap();
 
         assert_eq!(item.id, "movie:bbb-2014");
@@ -575,10 +771,18 @@ mod tests {
         let src = dir.path().join("a.mkv");
         std::fs::write(&src, b"uno").unwrap();
 
-        store.keep(&library_dir, "movie", "x", "X", None, &src).unwrap();
-        let again = store.keep(&library_dir, "movie", "x", "X", None, &src).unwrap();
+        store
+            .keep(&library_dir, "movie", "x", "X", None, &src)
+            .unwrap();
+        let again = store
+            .keep(&library_dir, "movie", "x", "X", None, &src)
+            .unwrap();
 
-        assert_eq!(store.list_library().unwrap().len(), 1, "sin duplicar la fila");
+        assert_eq!(
+            store.list_library().unwrap().len(),
+            1,
+            "sin duplicar la fila"
+        );
         assert_eq!(again.id, "movie:x");
     }
 
@@ -590,7 +794,9 @@ mod tests {
         let src = dir.path().join("m.mkv");
         std::fs::write(&src, b"x").unwrap();
 
-        let item = store.keep(&library_dir, "movie", "z", "Z", None, &src).unwrap();
+        let item = store
+            .keep(&library_dir, "movie", "z", "Z", None, &src)
+            .unwrap();
         std::fs::remove_file(&item.file_path).unwrap();
 
         // No debe fallar aunque el archivo ya no esté.
@@ -610,15 +816,21 @@ mod tests {
         std::fs::write(&a, b"a").unwrap();
         std::fs::write(&b, b"b").unwrap();
 
-        store.keep(&library_dir, "movie", "a", "A", Some("hashA"), &a).unwrap();
-        store.keep(&library_dir, "movie", "b", "B", None, &b).unwrap();
+        store
+            .keep(&library_dir, "movie", "a", "A", Some("hashA"), &a)
+            .unwrap();
+        store
+            .keep(&library_dir, "movie", "b", "B", None, &b)
+            .unwrap();
 
-        assert_eq!(store.library_info_hashes().unwrap(), vec!["hashA".to_string()]);
+        assert_eq!(
+            store.library_info_hashes().unwrap(),
+            vec!["hashA".to_string()]
+        );
     }
 
     fn contains_evil(p: &Path) -> bool {
-        if p
-            .file_name()
+        if p.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.contains("evil"))
         {
@@ -646,17 +858,23 @@ mod tests {
 
         // `id` con traversal viaja fuera de library_dir en el nombre.
         assert!(
-            store.keep(&library_dir, "movie", "../evil", "E", None, &src).is_err(),
+            store
+                .keep(&library_dir, "movie", "../evil", "E", None, &src)
+                .is_err(),
             "id con traversal debe rechazarse"
         );
         // `kind` con traversal (el caso reportado por el oracle).
         assert!(
-            store.keep(&library_dir, "../evil", "x", "E", None, &src).is_err(),
+            store
+                .keep(&library_dir, "../evil", "x", "E", None, &src)
+                .is_err(),
             "kind con traversal debe rechazarse"
         );
         // `id` con separador de ruta.
         assert!(
-            store.keep(&library_dir, "movie", "a/b", "E", None, &src).is_err(),
+            store
+                .keep(&library_dir, "movie", "a/b", "E", None, &src)
+                .is_err(),
             "id con '/' debe rechazarse"
         );
         // `kind` vacío.
@@ -670,6 +888,9 @@ mod tests {
             !contains_evil(dir.path()),
             "no debe existir ningún archivo con 'evil' en el tempdir"
         );
-        assert!(store.list_library().unwrap().is_empty(), "no debe registrar nada");
+        assert!(
+            store.list_library().unwrap().is_empty(),
+            "no debe registrar nada"
+        );
     }
 }

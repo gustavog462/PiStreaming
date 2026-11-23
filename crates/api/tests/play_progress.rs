@@ -23,6 +23,9 @@ fn plan_con_progress_url(session: &str, progress_url: Option<String>) -> Playbac
         needs_recode_audio: false,
         video_codec: "h264".into(),
         audio_codec: Some("aac".into()),
+        audio_tracks: vec![],
+        subtitle_tracks: vec![],
+        active_audio_index: None,
         progress_url,
     }
 }
@@ -49,6 +52,9 @@ async fn plan_expone_progress_url_de_dos_segmentos() {
         meta_id: Some("tt123".into()),
         title: Some("Dune".into()),
         media_path: None,
+        magnet: None,
+        transcode_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        audio_index: None,
     });
 
     let app = pistreaming_api::router(st);

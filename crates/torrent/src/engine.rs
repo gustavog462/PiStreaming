@@ -21,7 +21,10 @@ pub async fn open_session(
     egress_bind: Option<String>,
 ) -> Result<Arc<Session>, CoreError> {
     std::fs::create_dir_all(&cache_dir).ok();
-    let opts = SessionOptions { bind_device_name: egress_bind, ..Default::default() };
+    let opts = SessionOptions {
+        bind_device_name: egress_bind,
+        ..Default::default()
+    };
     Session::new_with_opts(cache_dir, opts)
         .await
         .map_err(|e| CoreError::Other(format!("no se pudo abrir la sesión torrent: {e}")))
@@ -61,7 +64,9 @@ pub async fn add_magnet(
 }
 
 /// Devuelve `(file_id, nombre relativo, len)` del video más grande del torrent.
-pub fn pick_largest_video(handle: &ManagedTorrentHandle) -> Result<(usize, PathBuf, u64), CoreError> {
+pub fn pick_largest_video(
+    handle: &ManagedTorrentHandle,
+) -> Result<(usize, PathBuf, u64), CoreError> {
     let picked = handle
         .with_metadata(|m| {
             let files: Vec<(usize, String, u64)> = m
@@ -136,10 +141,7 @@ fn is_video_name(name: &str) -> bool {
 pub async fn torrent_stream(
     handle: &ManagedTorrentHandle,
     file_id: usize,
-) -> Result<
-    impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static,
-    CoreError,
-> {
+) -> Result<impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static, CoreError> {
     handle
         .clone()
         .stream(file_id)

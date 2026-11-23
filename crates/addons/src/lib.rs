@@ -35,7 +35,10 @@ struct MetaResponse {
 
 impl AddonClient {
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http, timeout: Duration::from_secs(10) }
+        Self {
+            http,
+            timeout: Duration::from_secs(10),
+        }
     }
 
     fn base(url: &str) -> String {
@@ -75,7 +78,13 @@ impl AddonClient {
                 .map(|(k, v)| format!("{}={}", k, urlencoding(v)))
                 .collect();
             extra.sort();
-            format!("{}/catalog/{}/{}/{}.json", base, req.kind, req.id, extra.join("&"))
+            format!(
+                "{}/catalog/{}/{}/{}.json",
+                base,
+                req.kind,
+                req.id,
+                extra.join("&")
+            )
         }
     }
 
@@ -125,7 +134,10 @@ pub struct AddonManager {
 
 impl AddonManager {
     pub fn new(client: AddonClient) -> Self {
-        Self { client, addons: Vec::new() }
+        Self {
+            client,
+            addons: Vec::new(),
+        }
     }
 
     /// Construye un manager cargando los addons ya persistidos en `store`,
@@ -147,7 +159,11 @@ impl AddonManager {
     }
 
     pub async fn meta(&self, kind: &str, id: &str) -> CoreResult<MetaDetail> {
-        for a in self.addons.iter().filter(|a| a.enabled && a.manifest.supports("meta")) {
+        for a in self
+            .addons
+            .iter()
+            .filter(|a| a.enabled && a.manifest.supports("meta"))
+        {
             if let Ok(m) = self.client.meta(&a.url, kind, id).await {
                 return Ok(m);
             }
@@ -185,7 +201,9 @@ impl AddonManager {
                 let req = CatalogRequest::search(&catalog.kind, &catalog.id, query);
                 let base = a.url.clone();
                 let client = self.client.clone();
-                futs.push(async move { (a.manifest.name.clone(), client.catalog(&base, &req).await) });
+                futs.push(
+                    async move { (a.manifest.name.clone(), client.catalog(&base, &req).await) },
+                );
             }
         }
 
@@ -208,7 +226,11 @@ impl AddonManager {
 
     pub async fn streams(&self, kind: &str, id: &str) -> Vec<Stream> {
         let mut futs = Vec::new();
-        for a in self.addons.iter().filter(|a| a.enabled && a.manifest.supports("stream")) {
+        for a in self
+            .addons
+            .iter()
+            .filter(|a| a.enabled && a.manifest.supports("stream"))
+        {
             let base = a.url.clone();
             let client = self.client.clone();
             let name = a.manifest.name.clone();
@@ -316,7 +338,10 @@ mod tests {
             .await;
 
         let client = AddonClient::new(reqwest::Client::new());
-        let streams = client.streams(&server.uri(), "movie", "tt1160419").await.unwrap();
+        let streams = client
+            .streams(&server.uri(), "movie", "tt1160419")
+            .await
+            .unwrap();
         assert_eq!(streams.len(), 2);
         assert_eq!(streams[0].info_hash.as_deref(), Some("abc123"));
     }
