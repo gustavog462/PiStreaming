@@ -102,3 +102,28 @@ ssh gustavo@<pi> 'cd ~/pistreaming-src && source ~/.cargo/env && CARGO_BUILD_JOB
 - Tests end-to-end con un torrent real en el Pi (medir CPU/RAM).
 - ZIP al vuelo, miniaturas, traducción de subtítulos, auth, i18n.
 - Endurecer systemd (`MemoryMax`, `ProtectSystem`, etc.).
+
+## Resultados en el Pi (2026-11-23)
+
+- **Build release aarch64**: 19m35s (2 jobs, desde cero); incremental 1m27s.
+- **Binario**: 24 MB, instalado en `~/pistreaming`, servicio `active`.
+- **Smoke**: `/api/health` OK, `/api/search` OK (Cinemeta), `/api/streams` OK
+  (Torrentio), `/api/settings` OK, `/api/addons` OK, SPA 78 KB OK,
+  `/api/subtitles/external/...` → `{"languages":[]}` (sin API key),
+  `/hls/<sesión-inexistente>` → 404.
+- **Play (Sintel)**: 200 en 4,2 s; plan `direct` con `audio_tracks`
+  (AAC eng, default) y `active_audio_index: 0`.
+- **`/stream` direct**: 206, 1 MB en 5 ms (~194 MB/s).
+- **HLS ffmpeg directo** (MKV+AC3 de 10 s): playlist + `init.mp4` +
+  `seg_00000.m4s` en 9,75 s (`-re` a tiempo real).
+- **HLS API end-to-end** (sesión recuperada de la DB): playlist 200 (188 B,
+  13,2 s), segmento 200 (1,46 MB).
+- **`/stream` growing** (remux): 206, 1 MB en 13,2 s (~80 KB/s, tiempo real).
+- **`switch_audio`**: 200, plan devuelto.
+- **Subtítulo embebido inexistente**: 422.
+- **Memoria**: app ~22 MB RSS; cgroup 12–149 MB (incluye page cache).
+- **Recuperación**: sesión restaurada desde `play_sessions` al arrancar.
+
+> Nota: durante las pruebas el servicio se reinició para instalar el binario
+> nuevo; si había una reproducción en curso (p. ej. Logan), se interrumpió.
+> La caché de esa reproducción se conservó.
