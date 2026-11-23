@@ -4,7 +4,8 @@ Servidor de streaming personal tipo Stremio para Raspberry Pi, escrito en Rust.
 
 ## Estado
 
-- **Código fuente**: rama `fase2-playback` (fase 2, 2026-09-14).
+- **Código fuente**: rama `fase2-playback` (fase 2, 2026-09-14) y
+  `fase0-fase1` (reconstrucción del núcleo + HLS, 2026-11-23).
 - **Recuperación del despliegue** (2026-09-21): carpeta [`recuperado/`](recuperado/README.md).
 - El árbol de fuente original se perdió; `recuperado/` contiene el binario, los
   assets de la SPA, la configuración, la base de datos y la documentación
@@ -17,6 +18,8 @@ Servidor de streaming personal tipo Stremio para Raspberry Pi, escrito en Rust.
 - `docs/superpowers/` — planes y specs de las fases 1–3.
 - `recuperado/` — material recuperado del servidor (assets, configs, docs,
   datos).
+- `docs/fase0-fase1.md` — qué se implementó en la reconstrucción (growing,
+  media_cache, recovery, osdb, HLS, pistas de audio/subtítulos).
 
 ## Documentación de la recuperación
 
