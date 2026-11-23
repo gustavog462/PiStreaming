@@ -410,10 +410,22 @@ pub async fn play(
         }
     };
 
-    // 1) agregar el magnet (crea la carpeta de caché por info_hash)
-    let added = match add_magnet(&session, &body.magnet, &st.cache_dir).await {
-        Ok(a) => a,
-        Err(e) => return core_err(e),
+    // 1) agregar el magnet (crea la carpeta de caché por info_hash).
+    // Timeout de 30 s: una fuente sin seeds no debe colgar la petición.
+    let added = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        add_magnet(&session, &body.magnet, &st.cache_dir),
+    )
+    .await
+    {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => return core_err(e),
+        Err(_) => {
+            return err(
+                StatusCode::GATEWAY_TIMEOUT,
+                "no se pudo resolver la metadata del torrent (¿la fuente no tiene seeds?)",
+            )
+        }
     };
     let cache_dir = st.cache_dir.join(&added.info_hash);
     std::fs::create_dir_all(&cache_dir).ok();
@@ -455,16 +467,37 @@ pub async fn play(
         .write()
         .insert(session_id.clone(), added.handle.clone());
 
-    let probe_result = match local_probe_path(&added.handle, file_id) {
-        Some(path) => match probe(path.to_str().unwrap()).await {
-            Ok(p) => Ok(p),
-            Err(_) => probe(&raw_url).await,
-        },
-        None => probe(&raw_url).await,
-    };
+    // Probe con timeout de 8 s (fuente fría). Si falla, plan de fallback Remux
+    // con codecs desconocidos: el player lo intenta y el usuario puede reintentar.
+    let probe_timeout = std::time::Duration::from_secs(8);
+    let probe_result: Option<pistreaming_media::decide::Probe> =
+        match local_probe_path(&added.handle, file_id) {
+            Some(path) => {
+                match tokio::time::timeout(probe_timeout, probe(path.to_str().unwrap())).await {
+                    Ok(Ok(p)) => Some(p),
+                    _ => tokio::time::timeout(probe_timeout, probe(&raw_url))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok()),
+                }
+            }
+            None => tokio::time::timeout(probe_timeout, probe(&raw_url))
+                .await
+                .ok()
+                .and_then(|r| r.ok()),
+        };
     let p = match probe_result {
-        Ok(p) => p,
-        Err(e) => return core_err(e),
+        Some(p) => p,
+        None => {
+            tracing::warn!("probe falló o expiró; plan de fallback Remux");
+            pistreaming_media::decide::Probe {
+                container: String::new(),
+                video_codec: Some("h264".into()),
+                audio_codec: None,
+                audio_tracks: vec![],
+                subtitle_tracks: vec![],
+            }
+        }
     };
 
     let mut plan = match decide(&session_id, &p, &playback_url, Some(&raw_url)) {
