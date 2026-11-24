@@ -1319,7 +1319,12 @@ function playerView(src, progressUrl, session, title, plan) {
   const identity = identityFromProgressUrl(progressUrl);
   if (identity) rememberSessionIdentity(session, identity.kind, identity.id);
 
-  const video = el("video", { class: "video", controls: true, autoplay: true, playsinline: true, src, poster: session ? `/thumb/${encodeURIComponent(session)}` : null });
+  // HLS para rutas remux/recodeaudio (el backend ya genera playlist/segmentos);
+  // directo sigue usando el MP4 con Range (seekable). Fallback al MP4 si hls.js
+  // no está o falla.
+  const isHls = !!(session && plan && plan.route && plan.route !== "direct");
+  let hls = null;
+  const video = el("video", { class: "video", controls: true, autoplay: true, playsinline: true, src: isHls ? null : src, poster: session ? `/thumb/${encodeURIComponent(session)}` : null });
 
   // Capa de estado sobre el video: nunca dejar un rectángulo negro sin explicación.
   const status = el("div", { class: "video-status" },
@@ -1379,6 +1384,8 @@ function playerView(src, progressUrl, session, title, plan) {
   video.addEventListener("canplay", reveal);
   video.addEventListener("playing", reveal);
   video.addEventListener("error", () => {
+    // Con HLS, los errores fatales los gestiona hls.js (fallback al MP4).
+    if (hls) return;
     // Código 4 = el navegador no pudo cargar/decodificar la fuente. La sesión
     // sigue viva: falló el media/torrent (sin pares, datos fuera del caché o
     // remux caído). No es «sesión expirada» y hay que poder reintentar.
@@ -1404,6 +1411,33 @@ function playerView(src, progressUrl, session, title, plan) {
   });
   stallTimer = setTimeout(() => fail(
     "El video está tardando en arrancar; puede que la fuente no tenga seeds. Probá otra."), VIDEO_STALL_MS);
+
+  if (isHls) {
+    const hlsUrl = `/hls/${encodeURIComponent(session)}/index.m3u8`;
+    const resetStall = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => fail(
+        "El video está tardando en arrancar; puede que la fuente no tenga seeds. Probá otra."), VIDEO_STALL_MS);
+    };
+    if (window.Hls && window.Hls.isSupported()) {
+      hls = new window.Hls({ maxBufferLength: 30, maxMaxBufferLength: 60 });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(window.Hls.Events.MANIFEST_PARSED, resetStall);
+      hls.on(window.Hls.Events.FRAG_LOADED, resetStall);
+      hls.on(window.Hls.Events.ERROR, (_, data) => {
+        if (data && data.fatal) {
+          try { hls.destroy(); } catch (_) {}
+          hls = null;
+          video.src = src; // fallback al MP4 progresivo
+        }
+      });
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = hlsUrl;
+    } else {
+      video.src = src;
+    }
+  }
 
   // --- Selector de pistas (audio y subtítulos) ----------------------------
   // Cambio en caliente sin recargar la vista: subtítulos vía `textTracks` y
@@ -1760,6 +1794,7 @@ function playerView(src, progressUrl, session, title, plan) {
   // se llama al desmontar (remontaje vía playerView) y al cambiar de hash.
   const dispose = () => {
     clearInterval(tick);
+    if (hls) { try { hls.destroy(); } catch (_) {} hls = null; }
     teardownTracks();
     window.removeEventListener("hashchange", onHash);
     if (activePlayerDispose === dispose) activePlayerDispose = null;

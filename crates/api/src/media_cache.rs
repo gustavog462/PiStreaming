@@ -54,6 +54,7 @@ pub async fn reset(session: &Arc<parking_lot::RwLock<PlaySession>>) {
 pub async fn ensure_started(
     session: &Arc<parking_lot::RwLock<PlaySession>>,
     raw_url: &str,
+    state: Option<crate::SharedState>,
 ) -> Result<PathBuf, CoreError> {
     let (cache_dir, route, audio_index, done, has_child) = {
         let g = session.read();
@@ -136,12 +137,14 @@ pub async fn ensure_started(
     let sess = session.clone();
     let done2 = done.clone();
     tokio::spawn(async move {
+        let mut success = false;
         loop {
             let finished = {
                 let mut g = sess.write();
                 match g.ffmpeg.as_mut() {
                     Some(child) => match child.try_wait() {
-                        Ok(Some(_)) => {
+                        Ok(Some(status)) => {
+                            success = status.success();
                             g.ffmpeg = None;
                             true
                         }
@@ -156,6 +159,14 @@ pub async fn ensure_started(
             };
             if finished {
                 done2.store(true, Ordering::Relaxed);
+                if success {
+                    if let Some(st) = state.as_ref() {
+                        let sid = sess.read().id.clone();
+                        if let Err(e) = st.store.set_transcode_done(&sid, true) {
+                            tracing::warn!(error = %e, "no se pudo persistir transcode_done");
+                        }
+                    }
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -233,7 +244,7 @@ mod tests {
     async fn direct_no_lanza_ffmpeg() {
         let dir = tempfile::tempdir().unwrap();
         let s = session(dir.path(), PlaybackRoute::Direct);
-        let p = ensure_started(&s, "http://127.0.0.1:1/raw/s1")
+        let p = ensure_started(&s, "http://127.0.0.1:1/raw/s1", None)
             .await
             .unwrap();
         assert_eq!(p, playback_path(dir.path()));

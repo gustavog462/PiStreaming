@@ -702,7 +702,7 @@ pub async fn stream(
             // ffmpeg lee del propio `/raw` (con Range) y escribe `playback.mp4`
             // de forma progresiva; `growing` lo sirve mientras crece.
             let raw_url = format!("{}/raw/{}?file_id={}", st.public_base, session, file_id);
-            let path = match media_cache::ensure_started(&sess, &raw_url).await {
+            let path = match media_cache::ensure_started(&sess, &raw_url, Some(st.clone())).await {
                 Ok(p) => p,
                 Err(e) => return core_err(e),
             };
