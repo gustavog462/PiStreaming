@@ -1,0 +1,52 @@
+# Rutas HTTP de PiStreaming (versión desplegada 2026-09-21)
+# Extraídas de la SPA (assets/app.js) y de las cadenas del binario.
+
+# Salud
+GET    /api/health
+
+# Addons
+GET    /api/addons
+POST   /api/addons
+PATCH  /api/addons/:url
+DELETE /api/addons/:url
+GET    /api/addons/:url/stream/:session
+
+# Catálogo y metadatos
+GET    /api/search?query=<q>&kind=<movie|series>
+GET    /api/meta/:kind/:id
+GET    /api/streams/:kind/:id
+
+# Reproducción
+POST   /api/play
+GET    /api/play/:session
+POST   /api/play/:session/audio
+GET    /api/play/:session/subtitles/:track/raw
+POST   /api/warm
+GET    /stream/:session
+GET    /raw/:session?file_id=<n>
+GET    /subtitles/:session/:track/raw
+
+# Progreso
+GET    /api/progress/:kind/:id
+POST   /api/progress/:kind/:id
+
+# Ajustes
+GET    /api/settings
+PUT    /api/settings
+
+# Biblioteca
+GET    /api/library
+POST   /api/library
+DELETE /api/library/:id
+GET    /api/library/:id/stream
+
+# Subtítulos externos (OpenSubtitles)
+GET    /api/subtitles/external/:kind/:id
+POST   /api/subtitles/external/:kind/:id
+GET    /api/subtitles/external/:kind/:id/file/:lang
+
+# Assets y SPA
+GET    /assets/*path
+GET    /icon.svg
+GET    /play/:session
+GET    /

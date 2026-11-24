@@ -35,7 +35,10 @@ struct MetaResponse {
 
 impl AddonClient {
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http, timeout: Duration::from_secs(10) }
+        Self {
+            http,
+            timeout: Duration::from_secs(3),
+        }
     }
 
     fn base(url: &str) -> String {
@@ -75,7 +78,13 @@ impl AddonClient {
                 .map(|(k, v)| format!("{}={}", k, urlencoding(v)))
                 .collect();
             extra.sort();
-            format!("{}/catalog/{}/{}/{}.json", base, req.kind, req.id, extra.join("&"))
+            format!(
+                "{}/catalog/{}/{}/{}.json",
+                base,
+                req.kind,
+                req.id,
+                extra.join("&")
+            )
         }
     }
 
@@ -105,10 +114,13 @@ fn urlencoding(s: &str) -> String {
         .replace('?', "%3F")
 }
 
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use pistreaming_core::stream::rank_streams;
 use std::collections::HashSet;
 use tracing::warn;
+
+/// Tiempo máximo total para agregar resultados de addons (los lentos se ignoran).
+const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AddonRef {
@@ -125,7 +137,10 @@ pub struct AddonManager {
 
 impl AddonManager {
     pub fn new(client: AddonClient) -> Self {
-        Self { client, addons: Vec::new() }
+        Self {
+            client,
+            addons: Vec::new(),
+        }
     }
 
     /// Construye un manager cargando los addons ya persistidos en `store`,
@@ -147,9 +162,30 @@ impl AddonManager {
     }
 
     pub async fn meta(&self, kind: &str, id: &str) -> CoreResult<MetaDetail> {
-        for a in self.addons.iter().filter(|a| a.enabled && a.manifest.supports("meta")) {
-            if let Ok(m) = self.client.meta(&a.url, kind, id).await {
-                return Ok(m);
+        let mut futs = FuturesUnordered::new();
+        for a in self
+            .addons
+            .iter()
+            .filter(|a| a.enabled && a.manifest.supports("meta"))
+        {
+            let base = a.url.clone();
+            let client = self.client.clone();
+            let kind = kind.to_string();
+            let id = id.to_string();
+            futs.push(async move { client.meta(&base, &kind, &id).await });
+        }
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                res = futs.next() => {
+                    match res {
+                        Some(Ok(m)) => return Ok(m),
+                        Some(Err(_)) => {}
+                        None => break,
+                    }
+                }
             }
         }
         Err(CoreError::NotFound(format!("{kind}/{id}")))
@@ -176,7 +212,7 @@ impl AddonManager {
     }
 
     pub async fn search(&self, kind: &str, query: &str) -> Vec<MetaItem> {
-        let mut futs = Vec::new();
+        let mut futs = FuturesUnordered::new();
         for a in self.addons.iter().filter(|a| a.enabled) {
             for catalog in a.manifest.search_catalogs() {
                 if catalog.kind != kind {
@@ -185,30 +221,95 @@ impl AddonManager {
                 let req = CatalogRequest::search(&catalog.kind, &catalog.id, query);
                 let base = a.url.clone();
                 let client = self.client.clone();
-                futs.push(async move { (a.manifest.name.clone(), client.catalog(&base, &req).await) });
+                let name = a.manifest.name.clone();
+                futs.push(async move { (name, client.catalog(&base, &req).await) });
             }
         }
 
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for (name, res) in join_all(futs).await {
-            match res {
-                Ok(metas) => {
-                    for m in metas {
-                        if seen.insert(m.id.clone()) {
-                            out.push(m);
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    warn!("búsqueda: timeout global; se devuelven resultados parciales");
+                    break;
+                }
+                res = futs.next() => {
+                    match res {
+                        Some((_name, Ok(metas))) => {
+                            for m in metas {
+                                if seen.insert(m.id.clone()) {
+                                    out.push(m);
+                                }
+                            }
                         }
+                        Some((name, Err(e))) => {
+                            warn!(addon = %name, error = %e, "catálogo falló")
+                        }
+                        None => break,
                     }
                 }
-                Err(e) => warn!(addon = %name, error = %e, "catálogo falló"),
+            }
+        }
+        out
+    }
+
+    /// Catálogo (p. ej. `movie/top`) de los addons que lo exponen.
+    pub async fn catalog(&self, kind: &str, id: &str) -> Vec<MetaItem> {
+        let mut futs = FuturesUnordered::new();
+        for a in self.addons.iter().filter(|a| a.enabled) {
+            let has = a
+                .manifest
+                .catalogs
+                .iter()
+                .any(|c| c.kind == kind && c.id == id);
+            if !has {
+                continue;
+            }
+            let base = a.url.clone();
+            let client = self.client.clone();
+            let name = a.manifest.name.clone();
+            let req = CatalogRequest {
+                kind: kind.to_string(),
+                id: id.to_string(),
+                extra: Default::default(),
+            };
+            futs.push(async move { (name, client.catalog(&base, &req).await) });
+        }
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                res = futs.next() => {
+                    match res {
+                        Some((_name, Ok(metas))) => {
+                            for m in metas {
+                                if seen.insert(m.id.clone()) {
+                                    out.push(m);
+                                }
+                            }
+                        }
+                        Some((name, Err(e))) => warn!(addon = %name, error = %e, "catálogo falló"),
+                        None => break,
+                    }
+                }
             }
         }
         out
     }
 
     pub async fn streams(&self, kind: &str, id: &str) -> Vec<Stream> {
-        let mut futs = Vec::new();
-        for a in self.addons.iter().filter(|a| a.enabled && a.manifest.supports("stream")) {
+        let mut futs = FuturesUnordered::new();
+        for a in self
+            .addons
+            .iter()
+            .filter(|a| a.enabled && a.manifest.supports("stream"))
+        {
             let base = a.url.clone();
             let client = self.client.clone();
             let name = a.manifest.name.clone();
@@ -221,15 +322,28 @@ impl AddonManager {
         }
 
         let mut out = Vec::new();
-        for (name, res) in join_all(futs).await {
-            match res {
-                Ok(mut streams) => {
-                    for s in streams.iter_mut() {
-                        s.source_addon = Some(name.clone());
-                    }
-                    out.extend(streams);
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    warn!("streams: timeout global; se devuelven resultados parciales");
+                    break;
                 }
-                Err(e) => warn!(addon = %name, error = %e, "streams falló"),
+                res = futs.next() => {
+                    match res {
+                        Some((name, Ok(mut streams))) => {
+                            for s in streams.iter_mut() {
+                                s.source_addon = Some(name.clone());
+                            }
+                            out.extend(streams);
+                        }
+                        Some((name, Err(e))) => {
+                            warn!(addon = %name, error = %e, "streams falló")
+                        }
+                        None => break,
+                    }
+                }
             }
         }
         rank_streams(&mut out);
@@ -265,6 +379,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_manifest_acepta_url_de_manifest() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "org.test", "version": "1.0.0", "name": "Test",
+                "resources": ["catalog", "meta", "stream"],
+                "types": ["movie"],
+                "catalogs": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AddonClient::new(reqwest::Client::new());
+        // El usuario pega la URL del manifest: normalize_url debe quitar el
+        // sufijo para no pedir `/manifest.json/manifest.json`.
+        let m = client
+            .fetch_manifest(&format!("{}/manifest.json", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(m.id, "org.test");
+    }
+
+    #[tokio::test]
     async fn fetch_manifest_maps_500_to_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -292,7 +430,10 @@ mod tests {
             .await;
 
         let client = AddonClient::new(reqwest::Client::new());
-        let streams = client.streams(&server.uri(), "movie", "tt1160419").await.unwrap();
+        let streams = client
+            .streams(&server.uri(), "movie", "tt1160419")
+            .await
+            .unwrap();
         assert_eq!(streams.len(), 2);
         assert_eq!(streams[0].info_hash.as_deref(), Some("abc123"));
     }

@@ -14,7 +14,11 @@ impl CatalogRequest {
     pub fn search(kind: &str, id: &str, query: &str) -> Self {
         let mut extra = HashMap::new();
         extra.insert("search".to_string(), query.to_string());
-        Self { kind: kind.to_string(), id: id.to_string(), extra }
+        Self {
+            kind: kind.to_string(),
+            id: id.to_string(),
+            extra,
+        }
     }
 }
 

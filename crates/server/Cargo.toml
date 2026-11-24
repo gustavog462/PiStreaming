@@ -2,6 +2,7 @@
 name = "pistreaming-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "pistreaming"
@@ -12,6 +13,8 @@ pistreaming-core = { path = "../core" }
 pistreaming-store = { path = "../store" }
 pistreaming-addons = { path = "../addons" }
 pistreaming-api = { path = "../api" }
+pistreaming-torrent = { path = "../torrent" }
+parking_lot.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tracing.workspace = true

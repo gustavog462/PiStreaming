@@ -1,0 +1,40 @@
+[Unit]
+Description=PiStreaming (personal streaming server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gustavo
+Group=gustavo
+WorkingDirectory=/home/gustavo
+Environment=DATA_DIR=/home/gustavo/pistream-data
+# Opcional: AUTH_PASSWORD, AUTH_SECRET, PISTREAMING_API_KEY (chmod 600)
+EnvironmentFile=-/etc/pistreaming.env
+ExecStart=/home/gustavo/pistreaming
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/gustavo/pistream.log
+StandardError=append:/home/gustavo/pistream.log
+
+# --- Hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/gustavo/pistream-data -/home/gustavo/.cache/com.rqbit.dht
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- Límites (Pi 5 comparte RAM/CPU con otros servicios) ---
+MemoryHigh=768M
+MemoryMax=1G
+CPUQuota=200%
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+{
+  "cache_max_gb": "40",
+  "cache_ttl_hours": "4",
+  "egress_bind": "eth0",
+  "http_port": "8000",
+  "data_dir": "/home/pi/pistream-data"
+}
