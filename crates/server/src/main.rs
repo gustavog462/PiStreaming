@@ -200,6 +200,21 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| cfg.data_dir.join("library")),
         auth: Arc::new(pistreaming_api::auth::AuthConfig::from_env()),
+        metrics: Arc::new(pistreaming_api::metrics::Metrics::new()),
+    });
+
+    // Gauge de tamaño de caché para /metrics (cada 60 s).
+    let metrics_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let bytes = dir_size(&metrics_state.cache_dir).await;
+            metrics_state
+                .metrics
+                .cache_bytes
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
     });
 
     // Recuperar sesiones persistidas en segundo plano: la resolución de
@@ -347,6 +362,38 @@ async fn evict_cache(state: &pistreaming_api::SharedState) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// Tamaño total de un directorio (recursivo, solo metadata).
+async fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&p).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(e)) = rd.next_entry().await {
+            match e.metadata().await {
+                Ok(md) if md.is_dir() => stack.push(e.path()),
+                Ok(md) => {
+                    // Tamaño asignado en disco (los ficheros sparse de torrents
+                    // tienen un `len()` aparente enorme pero ocupan poco).
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        total += md.blocks() * 512;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        total += md.len();
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -574,3 +621,4 @@ mod tests {
         assert!(!cache_dir.exists(), "TTL 0 debe evictar la carpeta");
     }
 }
+

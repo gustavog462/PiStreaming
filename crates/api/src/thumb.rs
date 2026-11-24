@@ -70,7 +70,7 @@ pub async fn serve(State(st): State<SharedState>, Path(session): Path<String>) -
         }
         Err(e) => crate::err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("no se pudo leer la miniatura: {e}"),
+            format!("no se pudo leer la miniatura: {e}"),
         ),
     }
 }

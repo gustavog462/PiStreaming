@@ -256,6 +256,53 @@ impl AddonManager {
         out
     }
 
+    /// Catálogo (p. ej. `movie/top`) de los addons que lo exponen.
+    pub async fn catalog(&self, kind: &str, id: &str) -> Vec<MetaItem> {
+        let mut futs = FuturesUnordered::new();
+        for a in self.addons.iter().filter(|a| a.enabled) {
+            let has = a
+                .manifest
+                .catalogs
+                .iter()
+                .any(|c| c.kind == kind && c.id == id);
+            if !has {
+                continue;
+            }
+            let base = a.url.clone();
+            let client = self.client.clone();
+            let name = a.manifest.name.clone();
+            let req = CatalogRequest {
+                kind: kind.to_string(),
+                id: id.to_string(),
+                extra: Default::default(),
+            };
+            futs.push(async move { (name, client.catalog(&base, &req).await) });
+        }
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                res = futs.next() => {
+                    match res {
+                        Some((_name, Ok(metas))) => {
+                            for m in metas {
+                                if seen.insert(m.id.clone()) {
+                                    out.push(m);
+                                }
+                            }
+                        }
+                        Some((name, Err(e))) => warn!(addon = %name, error = %e, "catálogo falló"),
+                        None => break,
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub async fn streams(&self, kind: &str, id: &str) -> Vec<Stream> {
         let mut futs = FuturesUnordered::new();
         for a in self

@@ -229,6 +229,7 @@ async function route() {
   app.replaceChildren(loading());
   try {
     if (head === "search") return await viewSearch(parts[1]);
+    if (head === "discover") return await viewDiscover(seq);
     if (head === "detail") return await viewDetail(parts[1], parts.slice(2).join("/"), seq);
     if (head === "player") return await viewPlayer(parts[1], seq);
     if (head === "library") {
@@ -255,7 +256,10 @@ const KIND_LABEL = { movie: "películas", series: "series" };
 // --- i18n mínimo (ES/EN) ---------------------------------------------------
 const I18N = {
   es: {
-    navSearch: "Buscar", navLibrary: "Biblioteca", navAddons: "Addons", navSettings: "Ajustes",
+    navSearch: "Buscar", navDiscover: "Descubrir", navLibrary: "Biblioteca", navAddons: "Addons", navSettings: "Ajustes",
+    discover: "Descubrir", continueWatching: "Continuar viendo",
+    popularMovies: "Películas populares", popularSeries: "Series populares",
+    nothingHere: "Nada que mostrar todavía",
     movies: "Películas", series: "Series",
     searchMovie: "Buscar películas…", searchSeries: "Buscar series…",
     search: "Buscar", loading: "Cargando…", retry: "Reintentar", back: "Volver",
@@ -268,7 +272,10 @@ const I18N = {
     label_data_dir: "Directorio de datos",
   },
   en: {
-    navSearch: "Search", navLibrary: "Library", navAddons: "Addons", navSettings: "Settings",
+    navSearch: "Search", navDiscover: "Discover", navLibrary: "Library", navAddons: "Addons", navSettings: "Settings",
+    discover: "Discover", continueWatching: "Continue watching",
+    popularMovies: "Popular movies", popularSeries: "Popular series",
+    nothingHere: "Nothing to show yet",
     movies: "Movies", series: "Series",
     searchMovie: "Search movies…", searchSeries: "Search series…",
     search: "Search", loading: "Loading…", retry: "Retry", back: "Back",
@@ -298,7 +305,7 @@ function applyLang() {
   const nav = document.getElementById("nav");
   if (!nav) return;
   const labels = {
-    search: t("navSearch"), library: t("navLibrary"),
+    search: t("navSearch"), discover: t("navDiscover"), library: t("navLibrary"),
     addons: t("navAddons"), settings: t("navSettings"),
   };
   for (const a of nav.querySelectorAll("a")) {
@@ -314,6 +321,46 @@ function normalizeKind(k) {
 // El tipo se refleja en el hash; «movie» se mantiene como #/search pelado.
 function searchHash(kind) {
   return kind === "movie" ? "#/search" : `#/search/${kind}`;
+}
+
+async function viewDiscover(seq) {
+  setTab("discover");
+  const [cont, movies, series] = await Promise.all([
+    api("/api/continue").catch(() => ({ items: [] })),
+    api("/api/catalog/movie/top").catch(() => ({ metas: [] })),
+    api("/api/catalog/series/top").catch(() => ({ metas: [] })),
+  ]);
+  if (stale(seq)) return;
+  const rows = [];
+  const contItems = (cont.items || []).slice(0, 12);
+  if (contItems.length) {
+    const metas = await Promise.all(contItems.map((it) =>
+      api(`/api/meta/${it.kind}/${encodeURIComponent(it.id)}`).catch(() => null)));
+    if (stale(seq)) return;
+    const cards = contItems.map((it, i) => {
+      const m = metas[i] || { id: it.id, name: it.id, type: it.kind };
+      const card = metaCard(m);
+      if (it.duration) {
+        const pct = Math.min(100, Math.max(0, (it.position / it.duration) * 100));
+        card.append(el("div", { class: "progress-mini" },
+          el("div", { class: "progress-mini-fill", style: `width:${pct}%` })));
+      }
+      return card;
+    });
+    rows.push(el("section", { class: "discover-row" },
+      el("h2", { class: "section" }, t("continueWatching")),
+      el("div", { class: "grid" }, ...cards)));
+  }
+  const addRow = (title, metas) => {
+    if (!metas || !metas.length) return;
+    rows.push(el("section", { class: "discover-row" },
+      el("h2", { class: "section" }, title),
+      el("div", { class: "grid" }, ...metas.map(metaCard))));
+  };
+  addRow(t("popularMovies"), movies.metas);
+  addRow(t("popularSeries"), series.metas);
+  if (!rows.length) rows.push(empty(t("nothingHere")));
+  app.replaceChildren(el("h1", {}, t("discover")), ...rows);
 }
 
 async function viewSearch(rawKind) {

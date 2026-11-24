@@ -73,6 +73,9 @@ pub struct LibraryItem {
     pub created_at: i64,
 }
 
+/// Fila de progreso en curso: `(id, position, duration, updated_at)`.
+pub type ProgressRow = (String, f64, Option<f64>, String);
+
 /// Fila persistida de una sesión de reproducción (para recuperarla al arrancar).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaySessionRow {
@@ -416,6 +419,28 @@ impl Store {
         )
         .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(())
+    }
+
+    /// Progreso en curso (empezado y no terminado), más reciente primero.
+    pub fn list_progress(&self, limit: i64) -> CoreResult<Vec<ProgressRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, position, duration, updated_at FROM progress
+                 WHERE position > 0 AND (duration IS NULL OR position < duration - 15)
+                 ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| CoreError::Db(e.to_string()))?);
+        }
+        Ok(out)
     }
 
     pub fn get_progress(&self, id: &str) -> CoreResult<Option<(f64, Option<f64>)>> {

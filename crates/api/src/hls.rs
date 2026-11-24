@@ -37,6 +37,11 @@ pub fn playlist_path(cache_dir: &Path) -> PathBuf {
     hls_dir(cache_dir).join("index.m3u8")
 }
 
+/// Número de ffmpeg HLS activos (para métricas).
+pub fn active_count() -> usize {
+    children().lock().map(|m| m.len()).unwrap_or(0)
+}
+
 /// Mata el ffmpeg HLS de la sesión (si sigue vivo).
 pub fn stop(session_id: &str) {
     let child = children()

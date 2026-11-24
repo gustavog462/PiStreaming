@@ -117,6 +117,19 @@ impl AuthConfig {
         }
     }
 
+    #[doc(hidden)]
+    pub fn new_for_test(
+        password: Option<String>,
+        secret: Vec<u8>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self {
+            password,
+            secret,
+            api_key,
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.password.is_some()
     }
@@ -206,6 +219,7 @@ fn is_public(path: &str) -> bool {
         || path == "/api/login"
         || path == "/api/health"
         || path == "/embed.js"
+        || path == "/metrics"
         || path == "/icon.svg"
         || path.starts_with("/assets/")
         || path.starts_with("/embed/")

@@ -26,6 +26,7 @@ pub mod growing;
 pub mod hls;
 pub mod library;
 pub mod media_cache;
+pub mod metrics;
 pub mod osdb;
 pub mod range;
 pub mod recovery;
@@ -64,6 +65,8 @@ pub struct AppState {
     pub library_dir: std::path::PathBuf,
     /// Autenticación (contraseña + cookie, API key, token de embed).
     pub auth: auth::SharedAuth,
+    /// Métricas Prometheus.
+    pub metrics: StdArc<metrics::Metrics>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -82,6 +85,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/search", get(search))
         .route("/api/meta/:kind/:id", get(meta))
         .route("/api/streams/:kind/:id", get(streams))
+        .route("/api/catalog/:kind/:id", get(catalog))
+        .route("/api/continue", get(continue_watching))
+        .route("/metrics", get(metrics::endpoint))
         .route(
             "/api/progress/:kind/:id",
             get(get_progress).put(put_progress),
@@ -126,6 +132,10 @@ pub fn router(state: SharedState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            metrics::middleware,
         ))
         .with_state(state)
 }
@@ -302,6 +312,39 @@ pub async fn streams(
     let mgr = st.addons.read().await.clone();
     let streams = mgr.streams(&kind, &id).await;
     Json(serde_json::json!({ "streams": streams })).into_response()
+}
+
+/// GET /api/catalog/:kind/:id — catálogo (p. ej. movie/top) para Discover.
+pub async fn catalog(
+    State(st): State<SharedState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> Response {
+    let mgr = st.addons.read().await.clone();
+    let metas = mgr.catalog(&kind, &id).await;
+    Json(serde_json::json!({ "metas": metas })).into_response()
+}
+
+/// GET /api/continue — progreso en curso para «Continuar viendo».
+pub async fn continue_watching(State(st): State<SharedState>) -> Response {
+    match st.store.list_progress(20) {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .filter_map(|(id, position, duration, updated_at)| {
+                    let (kind, meta_id) = id.split_once(':')?;
+                    Some(serde_json::json!({
+                        "kind": kind,
+                        "id": meta_id,
+                        "position": position,
+                        "duration": duration,
+                        "updated_at": updated_at,
+                    }))
+                })
+                .collect();
+            Json(serde_json::json!({ "items": items })).into_response()
+        }
+        Err(e) => core_err(e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -980,6 +1023,12 @@ fn uuid_like(info_hash: &str, file_id: usize) -> String {
 /// Construye un AppState sin engine de torrents (test-only).
 #[doc(hidden)]
 pub fn test_state(dir: std::path::PathBuf) -> SharedState {
+    test_state_with_auth(dir, StdArc::new(auth::AuthConfig::from_env()))
+}
+
+/// Igual que `test_state` pero con una configuración de auth concreta.
+#[doc(hidden)]
+pub fn test_state_with_auth(dir: std::path::PathBuf, auth: auth::SharedAuth) -> SharedState {
     let store = Store::open(&dir.join("pistreaming.db")).expect("store");
     let client = AddonClient::new(reqwest::Client::new());
     let addons = AddonManager::new(client.clone());
@@ -1001,7 +1050,8 @@ pub fn test_state(dir: std::path::PathBuf) -> SharedState {
             data_dir: dir,
         },
         library_dir,
-        auth: StdArc::new(auth::AuthConfig::from_env()),
+        auth,
+        metrics: StdArc::new(metrics::Metrics::new()),
     })
 }
 
@@ -1068,6 +1118,7 @@ mod tests {
             },
             library_dir: dir.path().join("library"),
             auth: Arc::new(auth::AuthConfig::from_env()),
+            metrics: Arc::new(metrics::Metrics::new()),
         })
     }
 
@@ -1153,6 +1204,7 @@ mod tests {
             },
             library_dir: dir.path().join("library"),
             auth: Arc::new(auth::AuthConfig::from_env()),
+            metrics: Arc::new(metrics::Metrics::new()),
         }));
 
         let body = serde_json::json!({ "url": server.uri() }).to_string();
