@@ -20,6 +20,7 @@ use std::sync::Arc as StdArc;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod assets;
+pub mod embed;
 pub mod growing;
 pub mod hls;
 pub mod library;
@@ -29,6 +30,8 @@ pub mod range;
 pub mod recovery;
 pub mod session;
 pub mod settings;
+pub mod thumb;
+pub mod zip;
 
 pub struct AppState {
     pub store: Store,
@@ -103,6 +106,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/raw/:session", get(raw_stream))
         .route("/stream/:session", get(stream))
         .route("/hls/:session/*path", get(hls::serve))
+        .route("/api/zip/:session", get(zip::download))
+        .route("/thumb/:session", get(thumb::serve))
+        .route("/embed/:session", get(embed::page))
+        .route("/embed.js", get(embed::sdk))
         .route(
             "/api/settings",
             get(settings::get_settings).put(settings::put_settings),

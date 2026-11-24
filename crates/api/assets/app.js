@@ -1319,7 +1319,7 @@ function playerView(src, progressUrl, session, title, plan) {
   const identity = identityFromProgressUrl(progressUrl);
   if (identity) rememberSessionIdentity(session, identity.kind, identity.id);
 
-  const video = el("video", { class: "video", controls: true, autoplay: true, playsinline: true, src });
+  const video = el("video", { class: "video", controls: true, autoplay: true, playsinline: true, src, poster: session ? `/thumb/${encodeURIComponent(session)}` : null });
 
   // Capa de estado sobre el video: nunca dejar un rectángulo negro sin explicación.
   const status = el("div", { class: "video-status" },
@@ -1770,6 +1770,18 @@ function playerView(src, progressUrl, session, title, plan) {
 
   const actions = [el("button", { class: "btn ghost", onclick: () => history.back() }, "Volver")];
   if (session) {
+    // Compartir: copia el snippet de embed (iframe vía /embed.js).
+    actions.push(el("button", { class: "btn", onclick: () => {
+      const code = `<div data-pistreaming-session="${session}"></div>\n<script src="${location.origin}/embed.js" async></script>`;
+      const done = () => showBanner("Código de embed copiado");
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(code).then(done).catch(() => prompt("Copia el código de embed:", code));
+      } else {
+        prompt("Copia el código de embed:", code);
+      }
+    } }, "Compartir"));
+    // Descargar el torrent completo como ZIP al vuelo.
+    actions.push(el("a", { class: "btn", href: `/api/zip/${encodeURIComponent(session)}`, download: "" }, "Descargar ZIP"));
     actions.push(el("button", { class: "btn", onclick: async (e) => {
       e.target.disabled = true;
       try {

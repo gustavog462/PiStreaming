@@ -156,6 +156,17 @@ pub async fn torrent_stream(
     handle: &ManagedTorrentHandle,
     file_id: usize,
 ) -> Result<impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static, CoreError> {
+    // El stream solo se puede abrir cuando el torrent ha terminado su
+    // inicialización (initial check). `add_magnet` espera solo la metadata
+    // (play rápido), así que aquí esperamos a que el check termine; si no,
+    // librqbit devuelve "invalid state: initializing".
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        handle.wait_until_initialized(),
+    )
+    .await
+    .map_err(|_| CoreError::Other("timeout esperando la inicialización del torrent".into()))?
+    .map_err(|e| CoreError::Other(format!("no se pudo inicializar el torrent: {e}")))?;
     handle
         .clone()
         .stream(file_id)

@@ -24,6 +24,7 @@ tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 rust-embed.workspace = true
+zip.workspace = true
 # `test_state` (helper `#[doc(hidden)]`) construye un `reqwest::Client`.
 reqwest.workspace = true
 
