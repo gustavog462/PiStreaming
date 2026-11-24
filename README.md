@@ -20,6 +20,8 @@ Servidor de streaming personal tipo Stremio para Raspberry Pi, escrito en Rust.
   datos).
 - `docs/fase0-fase1.md` — qué se implementó en la reconstrucción (growing,
   media_cache, recovery, osdb, HLS, pistas de audio/subtítulos).
+- `docs/fase3.md` — autenticación (contraseña + cookie, API key, token de
+  embed) e i18n ES/EN.
 
 ## Documentación de la recuperación
 

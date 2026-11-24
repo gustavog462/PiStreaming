@@ -182,6 +182,15 @@ async function api(path, opts = {}) {
     clearTimeout(timer);
   }
   if (!res.ok) {
+    if (res.status === 401) {
+      // Sesión caducada o auth activada: vuelve al login y regresa aquí.
+      const next = encodeURIComponent(location.pathname + location.hash);
+      location.href = `/login?next=${next}`;
+      const err = new Error("no autorizado");
+      err.status = 401;
+      err.aborted = true;
+      throw err;
+    }
     let msg = `Error ${res.status}`;
     try {
       const j = await res.json();
@@ -203,11 +212,11 @@ function setTab(tab) {
   for (const a of nav.querySelectorAll("a")) a.classList.toggle("active", a.dataset.tab === tab);
 }
 
-const loading = () => el("div", { class: "state" }, el("div", { class: "spinner" }), "Cargando…");
+const loading = () => el("div", { class: "state" }, el("div", { class: "spinner" }), t("loading"));
 const empty = (msg) => el("div", { class: "state" }, msg);
 function errorBox(msg, retry) {
   return el("div", { class: "state error" }, el("p", {}, msg),
-    retry ? el("button", { class: "btn", onclick: retry }, "Reintentar") : null);
+    retry ? el("button", { class: "btn", onclick: retry }, t("retry")) : null);
 }
 
 async function route() {
@@ -238,10 +247,65 @@ async function route() {
 
 // --- Buscar ---------------------------------------------------------------
 const KINDS = [
-  { id: "movie", label: "Películas" },
-  { id: "series", label: "Series" },
+  { id: "movie", labelKey: "movies" },
+  { id: "series", labelKey: "series" },
 ];
 const KIND_LABEL = { movie: "películas", series: "series" };
+
+// --- i18n mínimo (ES/EN) ---------------------------------------------------
+const I18N = {
+  es: {
+    navSearch: "Buscar", navLibrary: "Biblioteca", navAddons: "Addons", navSettings: "Ajustes",
+    movies: "Películas", series: "Series",
+    searchMovie: "Buscar películas…", searchSeries: "Buscar series…",
+    search: "Buscar", loading: "Cargando…", retry: "Reintentar", back: "Volver",
+    backToDetail: "Volver a la ficha", play: "Reproducir", save: "Guardar",
+    share: "Compartir", downloadZip: "Descargar ZIP", noSources: "Sin fuentes disponibles",
+    settings: "Ajustes", language: "Idioma", logout: "Salir", saveSettings: "Guardar",
+    requiresRestart: "requiere reinicio",
+    label_cache_max_gb: "Caché máxima (GB)", label_cache_ttl_hours: "TTL de caché (horas)",
+    label_egress_bind: "Interfaz de salida", label_http_port: "Puerto HTTP",
+    label_data_dir: "Directorio de datos",
+  },
+  en: {
+    navSearch: "Search", navLibrary: "Library", navAddons: "Addons", navSettings: "Settings",
+    movies: "Movies", series: "Series",
+    searchMovie: "Search movies…", searchSeries: "Search series…",
+    search: "Search", loading: "Loading…", retry: "Retry", back: "Back",
+    backToDetail: "Back to details", play: "Play", save: "Save",
+    share: "Share", downloadZip: "Download ZIP", noSources: "No sources available",
+    settings: "Settings", language: "Language", logout: "Sign out", saveSettings: "Save",
+    requiresRestart: "requires restart",
+    label_cache_max_gb: "Max cache (GB)", label_cache_ttl_hours: "Cache TTL (hours)",
+    label_egress_bind: "Egress interface", label_http_port: "HTTP port",
+    label_data_dir: "Data directory",
+  },
+};
+let LANG = "es";
+try {
+  const saved = localStorage.getItem("lang");
+  if (saved === "es" || saved === "en") LANG = saved;
+  else if ((navigator.language || "").toLowerCase().startsWith("en")) LANG = "en";
+} catch (_) {}
+
+function t(key) {
+  const d = I18N[LANG] || I18N.es;
+  return d[key] || I18N.es[key] || key;
+}
+
+function applyLang() {
+  document.documentElement.lang = LANG;
+  const nav = document.getElementById("nav");
+  if (!nav) return;
+  const labels = {
+    search: t("navSearch"), library: t("navLibrary"),
+    addons: t("navAddons"), settings: t("navSettings"),
+  };
+  for (const a of nav.querySelectorAll("a")) {
+    const k = a.dataset.tab;
+    if (labels[k]) a.textContent = labels[k];
+  }
+}
 
 function normalizeKind(k) {
   return k === "series" ? "series" : "movie";
@@ -263,7 +327,7 @@ async function viewSearch(rawKind) {
       buttons[k.id].classList.toggle("active", on);
       buttons[k.id].setAttribute("aria-pressed", on ? "true" : "false");
     }
-    input.placeholder = `Buscar ${KIND_LABEL[kind]}…`;
+    input.placeholder = t(kind === "series" ? "searchSeries" : "searchMovie");
     // Reflejar el tipo en el hash sin recargar la vista (sobrevive reload/back).
     const hash = searchHash(kind);
     if (location.hash !== hash) history.replaceState(null, "", hash);
@@ -282,7 +346,7 @@ async function viewSearch(rawKind) {
         class: "segmented-btn",
         "aria-pressed": "false",
         onclick: () => chooseKind(k.id),
-      }, k.label);
+      }, t(k.labelKey));
       buttons[k.id] = b;
       return b;
     }),
@@ -543,7 +607,7 @@ async function viewDetail(kind, id, seq) {
 function mountSources(m, streams, kind, sourcesId, box) {
   const sources = streams.length
     ? renderSources(streams, kind, sourcesId, m.name)
-    : empty("Sin fuentes disponibles");
+    : empty(t("noSources"));
   if (box) {
     box.replaceChildren(sources);
   } else {
@@ -792,7 +856,7 @@ function sourceRow(it, isBest, kind, id, title) {
       badges,
     ),
     el("div", { class: "source-action" },
-      el("button", { class: "btn primary", onclick: (e) => startPlay(e.currentTarget, s, kind, id, title) }, "Reproducir"),
+      el("button", { class: "btn primary", onclick: (e) => startPlay(e.currentTarget, s, kind, id, title) }, t("play")),
     ),
   );
 }
@@ -1145,7 +1209,7 @@ function playerShell(title, onBack) {
     title ? el("h1", { class: "player-title" }, title) : null,
     el("div", { class: "video-wrap" }, video, status),
     el("div", { class: "player-actions" },
-      el("button", { class: "btn ghost", onclick: onBack }, "Volver")),
+      el("button", { class: "btn ghost", onclick: onBack }, t("back"))),
   );
 }
 
@@ -1290,7 +1354,7 @@ function renderSessionGone(container, kind, id) {
     el("div", { class: "state player-expired" },
       el("p", { class: "expired-title" }, "Sesión expirada"),
       el("p", {}, "Esta reproducción ya no está disponible. Volvé a la ficha y tocá Play otra vez."),
-      el("button", { class: "btn primary", onclick: () => backToDetail(kind, id) }, "Volver a la ficha"),
+      el("button", { class: "btn primary", onclick: () => backToDetail(kind, id) }, t("backToDetail")),
     ),
   );
 }
@@ -1305,8 +1369,8 @@ function renderStreamError(container, onRetry, onBack, hint) {
       hint ? el("p", { class: "expired-hint" }, hint) : null,
       el("p", {}, "La sesión sigue activa, pero el video no arrancó. Puede que la fuente no tenga pares, que los datos ya no estén en el caché o que el servidor no pueda preparar el video. Reintentá o probá otra fuente."),
       el("div", { class: "player-actions" },
-        el("button", { class: "btn primary", onclick: (e) => onRetry(e.currentTarget) }, "Reintentar"),
-        el("button", { class: "btn", onclick: onBack }, "Volver a la ficha"),
+        el("button", { class: "btn primary", onclick: (e) => onRetry(e.currentTarget) }, t("retry")),
+        el("button", { class: "btn", onclick: onBack }, t("backToDetail")),
       ),
     ),
   );
@@ -1803,7 +1867,7 @@ function playerView(src, progressUrl, session, title, plan) {
   window.addEventListener("hashchange", onHash, { once: true });
   activePlayerDispose = dispose;
 
-  const actions = [el("button", { class: "btn ghost", onclick: () => history.back() }, "Volver")];
+  const actions = [el("button", { class: "btn ghost", onclick: () => history.back() }, t("back"))];
   if (session) {
     // Compartir: copia el snippet de embed (iframe vía /embed.js).
     actions.push(el("button", { class: "btn", onclick: () => {
@@ -1814,9 +1878,9 @@ function playerView(src, progressUrl, session, title, plan) {
       } else {
         prompt("Copia el código de embed:", code);
       }
-    } }, "Compartir"));
+    } }, t("share")));
     // Descargar el torrent completo como ZIP al vuelo.
-    actions.push(el("a", { class: "btn", href: `/api/zip/${encodeURIComponent(session)}`, download: "" }, "Descargar ZIP"));
+    actions.push(el("a", { class: "btn", href: `/api/zip/${encodeURIComponent(session)}`, download: "" }, t("downloadZip")));
     actions.push(el("button", { class: "btn", onclick: async (e) => {
       e.target.disabled = true;
       try {
@@ -1828,7 +1892,7 @@ function playerView(src, progressUrl, session, title, plan) {
         showBanner("Guardado en la biblioteca");
       } catch (err) { showBanner(err.message); }
       finally { e.target.disabled = false; }
-    } }, "Guardar"));
+    } }, t("save")));
   }
   // Aviso de ruta: el usuario ve POR QUÉ arranca/suena distinto (transcode de
   // audio o video que el navegador puede no decodificar).
@@ -1867,7 +1931,7 @@ function libCard(it) {
     el("div", { class: "card-title" }, it.title || it.id),
     el("div", { class: "muted" }, `${it.kind} · ${mb} MB`),
     el("div", { class: "card-actions" },
-      el("a", { class: "btn primary", href: `#/library/${encodeURIComponent(it.id)}` }, "Reproducir"),
+      el("a", { class: "btn primary", href: `#/library/${encodeURIComponent(it.id)}` }, t("play")),
       el("button", { class: "btn ghost", onclick: async () => {
         try {
           await api(`/api/library/${encodeURIComponent(it.id)}`, { method: "DELETE" });
@@ -1932,13 +1996,6 @@ async function viewAddons(seq) {
 // --- Ajustes --------------------------------------------------------------
 const HOT_FIELDS = ["cache_max_gb", "cache_ttl_hours"];
 const STATIC_FIELDS = ["egress_bind", "http_port", "data_dir"];
-const LABELS = {
-  cache_max_gb: "Caché máxima (GB)",
-  cache_ttl_hours: "TTL de caché (horas)",
-  egress_bind: "Interfaz de salida",
-  http_port: "Puerto HTTP",
-  data_dir: "Directorio de datos",
-};
 const NUMERIC = new Set(["cache_max_gb", "cache_ttl_hours", "http_port"]);
 
 async function viewSettings(seq) {
@@ -1962,7 +2019,7 @@ async function viewSettings(seq) {
       });
       const applied = (r.applied || []).length ? `Aplicado: ${r.applied.join(", ")}. ` : "";
       const restart = (r.requires_restart || []).length
-        ? `Requiere reinicio: ${r.requires_restart.map((k) => LABELS[k] || k).join(", ")}.`
+        ? `${t("requiresRestart")}: ${r.requires_restart.map((k) => t("label_" + k) || k).join(", ")}.`
         : "";
       showBanner(applied + restart || "Guardado");
       route();
@@ -1971,13 +2028,29 @@ async function viewSettings(seq) {
   for (const f of [...HOT_FIELDS, ...STATIC_FIELDS]) {
     const input = el("input", { value: s[f] ?? "", type: NUMERIC.has(f) ? "number" : "text" });
     inputs[f] = input;
-    const label = el("label", { class: "field" }, el("span", {}, LABELS[f] || f), input);
-    if (STATIC_FIELDS.includes(f)) label.append(el("small", { class: "muted" }, "requiere reinicio"));
+    const label = el("label", { class: "field" }, el("span", {}, t("label_" + f) || f), input);
+    if (STATIC_FIELDS.includes(f)) label.append(el("small", { class: "muted" }, t("requiresRestart")));
     form.append(label);
   }
-  form.append(el("button", { class: "btn primary", type: "submit" }, "Guardar"));
-  app.replaceChildren(el("h1", {}, "Ajustes"), form);
+  form.append(el("button", { class: "btn primary", type: "submit" }, t("saveSettings")));
+  const langSel = el("select", { class: "sel", "aria-label": t("language"), onchange: (e) => {
+    LANG = e.target.value === "en" ? "en" : "es";
+    try { localStorage.setItem("lang", LANG); } catch (_) {}
+    applyLang();
+    route();
+  } },
+    el("option", { value: "es", selected: LANG === "es" }, "Español"),
+    el("option", { value: "en", selected: LANG === "en" }, "English"),
+  );
+  const langField = el("label", { class: "field" }, el("span", {}, t("language")), langSel);
+  const children = [el("h1", {}, t("settings")), langField, form];
+  if (s.auth_enabled) {
+    children.push(el("form", { method: "post", action: "/api/logout", class: "form" },
+      el("button", { class: "btn", type: "submit" }, t("logout"))));
+  }
+  app.replaceChildren(...children);
 }
 
 window.addEventListener("hashchange", route);
+applyLang();
 route();

@@ -199,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
             .library_dir
             .clone()
             .unwrap_or_else(|| cfg.data_dir.join("library")),
+        auth: Arc::new(pistreaming_api::auth::AuthConfig::from_env()),
     });
 
     // Recuperar sesiones persistidas en segundo plano: la resolución de

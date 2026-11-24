@@ -20,6 +20,7 @@ use std::sync::Arc as StdArc;
 use tokio::sync::{Mutex, RwLock};
 
 pub mod assets;
+pub mod auth;
 pub mod embed;
 pub mod growing;
 pub mod hls;
@@ -61,12 +62,17 @@ pub struct AppState {
     pub static_settings: settings::StaticSettings,
     /// Directorio de la biblioteca permanente (`<data_dir>/library`).
     pub library_dir: std::path::PathBuf,
+    /// Autenticación (contraseña + cookie, API key, token de embed).
+    pub auth: auth::SharedAuth,
 }
 
 pub type SharedState = Arc<AppState>;
 
 pub fn router(state: SharedState) -> Router {
     Router::new()
+        .route("/login", get(auth::login_page))
+        .route("/api/login", axum::routing::post(auth::login))
+        .route("/api/logout", axum::routing::post(auth::logout))
         .route("/api/health", get(health))
         .route("/api/addons", get(list_addons).post(add_addon))
         .route(
@@ -117,6 +123,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/library", get(library::list).post(library::keep))
         .route("/api/library/:id", axum::routing::delete(library::delete))
         .route("/library/:id/stream", get(library::stream))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::middleware,
+        ))
         .with_state(state)
 }
 
@@ -991,6 +1001,7 @@ pub fn test_state(dir: std::path::PathBuf) -> SharedState {
             data_dir: dir,
         },
         library_dir,
+        auth: StdArc::new(auth::AuthConfig::from_env()),
     })
 }
 
@@ -1056,6 +1067,7 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
             },
             library_dir: dir.path().join("library"),
+            auth: Arc::new(auth::AuthConfig::from_env()),
         })
     }
 
@@ -1140,6 +1152,7 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
             },
             library_dir: dir.path().join("library"),
+            auth: Arc::new(auth::AuthConfig::from_env()),
         }));
 
         let body = serde_json::json!({ "url": server.uri() }).to_string();

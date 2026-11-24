@@ -9,6 +9,8 @@ User=gustavo
 Group=gustavo
 WorkingDirectory=/home/gustavo
 Environment=DATA_DIR=/home/gustavo/pistream-data
+# Opcional: AUTH_PASSWORD, AUTH_SECRET, PISTREAMING_API_KEY (chmod 600)
+EnvironmentFile=-/etc/pistreaming.env
 ExecStart=/home/gustavo/pistreaming
 Restart=always
 RestartSec=3

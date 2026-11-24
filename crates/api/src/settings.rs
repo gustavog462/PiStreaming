@@ -74,6 +74,7 @@ pub async fn get_settings(State(st): State<SharedState>) -> Response {
         "data_dir": data_dir,
         "http_port": http_port,
         "requires_restart": [KEY_EGRESS_BIND, KEY_HTTP_PORT, KEY_DATA_DIR],
+        "auth_enabled": st.auth.enabled(),
     }))
     .into_response()
 }

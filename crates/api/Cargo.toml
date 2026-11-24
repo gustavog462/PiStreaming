@@ -25,6 +25,8 @@ tracing.workspace = true
 parking_lot.workspace = true
 rust-embed.workspace = true
 zip.workspace = true
+sha2.workspace = true
+hmac.workspace = true
 # `test_state` (helper `#[doc(hidden)]`) construye un `reqwest::Client`.
 reqwest.workspace = true
 

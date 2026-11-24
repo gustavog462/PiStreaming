@@ -46,4 +46,6 @@ bytes = "1"
 http = "1"
 rust-embed = "8"
 zip = { version = "9", default-features = false }
+sha2 = "0.10"
+hmac = "0.12"
 parking_lot = "0.12"

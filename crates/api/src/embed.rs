@@ -18,9 +18,13 @@ pub async fn page(State(st): State<SharedState>, Path(session): Path<String>) ->
         let g = sess.read();
         (g.plan.route, g.file_id)
     };
+    // Token de embed: el iframe es cross-site y no lleva la cookie de sesión.
+    let token = st.auth.embed_token(&session);
     let src = match route {
-        PlaybackRoute::Direct => format!("/raw/{}?file_id={}", session, file_id),
-        _ => format!("/stream/{}", session),
+        PlaybackRoute::Direct => {
+            format!("/raw/{}?file_id={}&token={}", session, file_id, token)
+        }
+        _ => format!("/stream/{}?token={}", session, token),
     };
     let html = format!(
         r#"<!doctype html>
