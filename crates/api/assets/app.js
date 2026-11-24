@@ -750,6 +750,10 @@ function codecWarn(s) {
   if (/\bhevc\b|\bx265\b|\bh\.?265\b/.test(hay)) hits.push("x265/HEVC");
   if (/\b10.?bit\b/.test(hay)) hits.push("10bit");
   if (/\bdolby ?vision\b|\bdv\b/.test(hay)) hits.push("Dolby Vision");
+  // 4K/UHD/HDR/AV1/VP9: el Pi no puede transcodificar 4K en tiempo real y
+  // muchos navegadores móviles no decodifican HEVC/AV1. Se ocultan por defecto
+  // con «Solo compatibles con el navegador».
+  if (/\b2160p\b|\b4k\b|\buhd\b|\bhdr\b|\bav1\b|\bvp9\b/.test(hay)) hits.push("4K/HEVC/AV1");
   return hits.length ? hits.slice(0, 2).join(" · ") : null;
 }
 
@@ -1385,8 +1389,8 @@ function playerView(src, progressUrl, session, title, plan) {
       // Pista específica: si el plan venía de una fuente HEVC/10-bit/DV, el
       // navegador casi seguro no decodifica ese video (el Pi no transcodifica).
       const vc = plan && typeof plan.video_codec === "string" ? plan.video_codec.toLowerCase() : "";
-      const hint = (vc === "hevc" || vc === "h265")
-        ? "Esta fuente es x265/HEVC: tu navegador no la decodifica y el servidor no puede convertirla (verá la misma advertencia en la ficha). Elegí una fuente x264/AVC."
+      const hint = (vc === "hevc" || vc === "h265" || (plan && plan.browser_may_fail))
+        ? "Esta fuente es x265/HEVC, AV1 o 4K: tu navegador no la decodifica y el Pi no puede convertirla en tiempo real. Elegí una fuente x264/AVC 1080p."
         : null;
       renderStreamError(wrap, retry,
         () => backToDetail(identity ? identity.kind : null, identity ? identity.id : null), hint);

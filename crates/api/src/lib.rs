@@ -486,6 +486,7 @@ pub async fn play(
                 .ok()
                 .and_then(|r| r.ok()),
         };
+    let probe_ok = probe_result.is_some();
     let p = match probe_result {
         Some(p) => p,
         None => {
@@ -504,6 +505,11 @@ pub async fn play(
         Ok(plan) => plan,
         Err(e) => return core_err(e),
     };
+    // Si el probe falló (plan de fallback), no sabemos el codec real: marca
+    // `browser_may_fail` para que la SPA avise y ofrezca una fuente x264.
+    if !probe_ok {
+        plan.browser_may_fail = true;
+    }
     if plan.route == PlaybackRoute::Direct {
         plan.playback_url = raw_url.clone();
     }

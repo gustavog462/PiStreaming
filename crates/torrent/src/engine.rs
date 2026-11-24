@@ -54,10 +54,24 @@ pub async fn add_magnet(
     let handle = resp
         .into_handle()
         .ok_or_else(|| CoreError::Other("respuesta de add_torrent sin handle".into()))?;
-    handle
-        .wait_until_initialized()
-        .await
-        .map_err(|e| CoreError::Other(format!("metadata no resuelta: {e}")))?;
+    // Esperar SOLO a que la metadata (info del torrent) esté disponible.
+    // `wait_until_initialized()` espera además al initial check (checksum de
+    // los datos ya en disco), que en un torrent de varios GB puede tardar
+    // decenas de segundos y no debe bloquear el play: el stream puede leer
+    // los trozos disponibles mientras el check sigue en segundo plano.
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        if handle.with_metadata(|_| ()).is_ok() {
+            break;
+        }
+        if waited >= std::time::Duration::from_secs(30) {
+            return Err(CoreError::Other(
+                "metadata no resuelta (¿la fuente no tiene seeds?)".into(),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        waited += std::time::Duration::from_millis(100);
+    }
     // `Id20` implementa `as_string()` (hex) pero no `Display`, así que no hay `to_string()`.
     let info_hash = handle.info_hash().as_string();
     Ok(AddedTorrent { handle, info_hash })
