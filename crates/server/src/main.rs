@@ -201,9 +201,17 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| cfg.data_dir.join("library")),
     });
 
-    // Recuperar sesiones persistidas (best effort) y podar las caducadas.
-    pistreaming_api::recovery::load_at_boot(&state).await;
-    pistreaming_api::recovery::prune(&state, (cache_ttl_hours as i64).saturating_mul(3600));
+    // Recuperar sesiones persistidas en segundo plano: la resolución de
+    // metadata de un torrent frío puede tardar decenas de segundos y no debe
+    // bloquear el arranque del servidor HTTP.
+    let recovery_state = state.clone();
+    tokio::spawn(async move {
+        pistreaming_api::recovery::load_at_boot(&recovery_state).await;
+        pistreaming_api::recovery::prune(
+            &recovery_state,
+            (cache_ttl_hours as i64).saturating_mul(3600),
+        );
+    });
 
     // Job de eviction: cada 10 min, cierra sesiones inactivas fuera de TTL y
     // evicta por tamaño/TTL. Lee los ajustes en caliente y nunca toca la biblioteca.

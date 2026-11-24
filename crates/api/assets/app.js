@@ -544,7 +544,17 @@ function mountSources(m, streams, kind, sourcesId, box) {
   const sources = streams.length
     ? renderSources(streams, kind, sourcesId, m.name)
     : empty("Sin fuentes disponibles");
-  if (box) box.replaceChildren(sources);
+  if (box) {
+    box.replaceChildren(sources);
+  } else {
+    // Sin `box` (película): reemplaza la vista entera, sustituyendo el
+    // spinner inicial por la ficha + la lista de fuentes.
+    app.replaceChildren(
+      detailHead(m, sourcesId),
+      el("h2", { class: "section" }, "Fuentes"),
+      sources,
+    );
+  }
   // Pre-warm: calienta el torrent de la mejor fuente mientras el usuario
   // revisa la lista. Fire-and-forget: si falla (o tarda), play lo resuelve.
   warmBestSource(streams);

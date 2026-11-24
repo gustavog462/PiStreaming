@@ -37,7 +37,7 @@ impl AddonClient {
     pub fn new(http: reqwest::Client) -> Self {
         Self {
             http,
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(3),
         }
     }
 
@@ -114,10 +114,13 @@ fn urlencoding(s: &str) -> String {
         .replace('?', "%3F")
 }
 
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use pistreaming_core::stream::rank_streams;
 use std::collections::HashSet;
 use tracing::warn;
+
+/// Tiempo máximo total para agregar resultados de addons (los lentos se ignoran).
+const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AddonRef {
@@ -159,13 +162,30 @@ impl AddonManager {
     }
 
     pub async fn meta(&self, kind: &str, id: &str) -> CoreResult<MetaDetail> {
+        let mut futs = FuturesUnordered::new();
         for a in self
             .addons
             .iter()
             .filter(|a| a.enabled && a.manifest.supports("meta"))
         {
-            if let Ok(m) = self.client.meta(&a.url, kind, id).await {
-                return Ok(m);
+            let base = a.url.clone();
+            let client = self.client.clone();
+            let kind = kind.to_string();
+            let id = id.to_string();
+            futs.push(async move { client.meta(&base, &kind, &id).await });
+        }
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                res = futs.next() => {
+                    match res {
+                        Some(Ok(m)) => return Ok(m),
+                        Some(Err(_)) => {}
+                        None => break,
+                    }
+                }
             }
         }
         Err(CoreError::NotFound(format!("{kind}/{id}")))
@@ -192,7 +212,7 @@ impl AddonManager {
     }
 
     pub async fn search(&self, kind: &str, query: &str) -> Vec<MetaItem> {
-        let mut futs = Vec::new();
+        let mut futs = FuturesUnordered::new();
         for a in self.addons.iter().filter(|a| a.enabled) {
             for catalog in a.manifest.search_catalogs() {
                 if catalog.kind != kind {
@@ -201,31 +221,43 @@ impl AddonManager {
                 let req = CatalogRequest::search(&catalog.kind, &catalog.id, query);
                 let base = a.url.clone();
                 let client = self.client.clone();
-                futs.push(
-                    async move { (a.manifest.name.clone(), client.catalog(&base, &req).await) },
-                );
+                let name = a.manifest.name.clone();
+                futs.push(async move { (name, client.catalog(&base, &req).await) });
             }
         }
 
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for (name, res) in join_all(futs).await {
-            match res {
-                Ok(metas) => {
-                    for m in metas {
-                        if seen.insert(m.id.clone()) {
-                            out.push(m);
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    warn!("búsqueda: timeout global; se devuelven resultados parciales");
+                    break;
+                }
+                res = futs.next() => {
+                    match res {
+                        Some((_name, Ok(metas))) => {
+                            for m in metas {
+                                if seen.insert(m.id.clone()) {
+                                    out.push(m);
+                                }
+                            }
                         }
+                        Some((name, Err(e))) => {
+                            warn!(addon = %name, error = %e, "catálogo falló")
+                        }
+                        None => break,
                     }
                 }
-                Err(e) => warn!(addon = %name, error = %e, "catálogo falló"),
             }
         }
         out
     }
 
     pub async fn streams(&self, kind: &str, id: &str) -> Vec<Stream> {
-        let mut futs = Vec::new();
+        let mut futs = FuturesUnordered::new();
         for a in self
             .addons
             .iter()
@@ -243,15 +275,28 @@ impl AddonManager {
         }
 
         let mut out = Vec::new();
-        for (name, res) in join_all(futs).await {
-            match res {
-                Ok(mut streams) => {
-                    for s in streams.iter_mut() {
-                        s.source_addon = Some(name.clone());
-                    }
-                    out.extend(streams);
+        let deadline = tokio::time::sleep(GATHER_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    warn!("streams: timeout global; se devuelven resultados parciales");
+                    break;
                 }
-                Err(e) => warn!(addon = %name, error = %e, "streams falló"),
+                res = futs.next() => {
+                    match res {
+                        Some((name, Ok(mut streams))) => {
+                            for s in streams.iter_mut() {
+                                s.source_addon = Some(name.clone());
+                            }
+                            out.extend(streams);
+                        }
+                        Some((name, Err(e))) => {
+                            warn!(addon = %name, error = %e, "streams falló")
+                        }
+                        None => break,
+                    }
+                }
             }
         }
         rank_streams(&mut out);

@@ -764,16 +764,22 @@ pub async fn warm(
         let enc = tr.replace(':', "%3A").replace('/', "%2F");
         magnet.push_str(&format!("&tr={enc}"));
     }
-    match add_magnet(&session, &magnet, &st.cache_dir).await {
-        Ok(added) => {
-            st.handles
-                .write()
-                .insert(format!("warm-{}", added.info_hash), added.handle);
-            Json(serde_json::json!({ "status": "ok", "info_hash": added.info_hash }))
-                .into_response()
+    // Fire-and-forget: el warm es best-effort y no debe bloquear la petición
+    // (la resolución de metadata de un torrent frío puede tardar decenas de
+    // segundos). El `play` reutiliza el torrent ya añadido por info_hash.
+    let st2 = st.clone();
+    let session2 = session.clone();
+    tokio::spawn(async move {
+        match add_magnet(&session2, &magnet, &st2.cache_dir).await {
+            Ok(added) => {
+                st2.handles
+                    .write()
+                    .insert(format!("warm-{}", added.info_hash), added.handle);
+            }
+            Err(e) => tracing::warn!(error = %e, "warm falló"),
         }
-        Err(e) => core_err(e),
-    }
+    });
+    Json(serde_json::json!({ "status": "warming" })).into_response()
 }
 
 #[derive(Deserialize)]
