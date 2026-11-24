@@ -1494,6 +1494,16 @@ function playerView(src, progressUrl, session, title, plan) {
   };
   video.addEventListener("canplay", reveal);
   video.addEventListener("playing", reveal);
+  // Buffering: si el player se queda sin datos (torrent lento), vuelve a
+  // mostrar el estado en vez de dejar el vídeo congelado sin explicación.
+  video.addEventListener("waiting", () => {
+    if (started) {
+      status.hidden = false;
+      const span = status.querySelector("span");
+      if (span) span.textContent = "Cargando… (la fuente va lenta)";
+    }
+  });
+  video.addEventListener("playing", () => { status.hidden = true; });
   video.addEventListener("error", () => {
     // Con HLS, los errores fatales los gestiona hls.js (fallback al MP4).
     if (hls) return;

@@ -81,7 +81,12 @@ pub async fn ensure_started(
     std::fs::create_dir_all(&dir).ok();
 
     let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-y", "-re", "-i", raw_url]);
+    // `-rw_timeout`: si el torrent se queda sin datos >15 s, ffmpeg sale en vez
+    // de colgarse para siempre (el player muestra el aviso de fuente lenta).
+    cmd.args([
+        "-v", "error", "-y", "-re", "-probesize", "1M", "-analyzeduration", "0",
+        "-rw_timeout", "15000000", "-i", raw_url,
+    ]);
     match route {
         PlaybackRoute::Remux => {
             cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]);
